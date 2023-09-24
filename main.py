@@ -1684,6 +1684,48 @@ def autoaccepton(message):
             except:
                 pass
 
+
+@bot.message_handler(commands=['Trigger', 'trigger', 'tr'])
+def trigger(message):
+    global stoptr
+    if message.chat.id in adm:
+        try:
+            stoptr = 0
+            def tr(id):
+                global stoptr
+                pixel = pyautogui.pixel(pyautogui.position().x + 2, pyautogui.position().y + 2)
+                while stoptr == 0:
+                    if pixel != pyautogui.pixel(pyautogui.position().x + 2, pyautogui.position().y + 2):
+                        leftClick()
+                        bot.send_message(id, "Успешный выстрел")
+                        stoptr = 1
+                        break
+                    else:
+                        time.sleep(0.01)
+            threading.Thread(target=tr, args=(message.chat.id,)).start()
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except Exception as e:
+            try:
+                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log.write(
+                    f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+                log.close()
+            except:
+                pass
+
+
+@bot.message_handler(commands=['TriggerOff', 'triggeroff', 'tf'])
+def triggeroff(message):
+    global stoptr
+    if message.chat.id in adm:
+        try:
+            stoptr = 1
+            bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
+        except Exception as e:
+            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'), "a")
+            log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
+
 try:
     bot.polling(none_stop=True)
 except:
