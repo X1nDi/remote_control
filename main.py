@@ -5,39 +5,36 @@ from tkinter import *
 from tkinter import messagebox
 import json
 import threading
+import psutil
 
 
-with open("config.json") as f:
+foldconfig = "C:/Users/User/AppData/Roaming/cleaner/config.json"
+allowed = list()
+actived = 0
+py = 0
+
+with open(foldconfig, "r") as f:
     config = json.load(f)
-
-if config["allowed"] is None:
-    config["allowed"] = list()
 
 if config["blocked"] is None:
     config["blocked"] = list()
 
 
-def ews(key: str, value):
-    config[key] = value
-    with open("config.json", "w") as f:
-        json.dump(config, f)
-
-
-ews("actived", 0)
-
 while True:
-    with open("config.json") as f:
+    with open(foldconfig, "r") as f:
         config = json.load(f)
+    if config["blocked"] is None:
+        config["blocked"] = list()
 
-    if config["allowed"] != None:
-        for i in config["allowed"]:
-            if i not in os.listdir("c:/Users/User/Downloads/"):
-                config["allowed"].remove(i)
-                ews("allowed", config["allowed"])
+    for i in allowed:
+        if i not in os.listdir("c:/Users/User/Downloads/"):
+            allowed.remove(i)
 
     for i in os.listdir("c:/Users/User/Downloads/"):
-        if (not config["allowed"] or i not in config["allowed"]) and config["actived"] == 0 and i.split(".")[-1] in config["blocked"]:
-            def maint(prog: str):
+        if i not in allowed and actived == 0 and i.split(".")[-1] in config["blocked"]:
+            def mainblock(prog: str):
+                global allowed
+                global actived
                 file = i
 
                 def sp():
@@ -51,9 +48,8 @@ while True:
                         time.sleep(0.5)
                         os.system('start explorer.exe')
                         messagebox.showinfo("Информация", "Приятного использования!")
-                        config["allowed"].append(prog)
-                        ews("allowed", config["allowed"])
-                        ews("actived", 0)
+                        allowed.append(prog)
+                        actived = 0
                     else:
                         ent.delete(0, END)
                         ent.insert(0, "")
@@ -70,11 +66,13 @@ while True:
                         time.sleep(0.5)
                         os.system('start explorer.exe')
                         messagebox.showinfo("Информация", "Приятного использования!")
-                        ews("actived", 0)
+                        actived = 0
                     except:
                         messagebox.showerror("Ошибка", "Не удалось удалить файл")
-
-                os.system('taskkill /f /im explorer.exe')
+                try:
+                    os.system('taskkill /f /im explorer.exe')
+                except:
+                    pass
                 time.sleep(1)
 
                 wm = Tk()
@@ -109,6 +107,13 @@ while True:
                 wm.attributes('-alpha', 0.8)
                 wm.after_idle(wm.attributes, '-topmost', True)
                 wm.mainloop()
-            threading.Thread(target=maint, args=(i,)).start()
-            ews("actived", 1)
-    time.sleep(0.1)
+            threading.Thread(target=mainblock, args=(i,)).start()
+            actived = 1
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info["name"] == "pyw.exe":
+            py += 1
+    if py < 2:
+        os.startfile("C:/Users/User/AppData/Roaming/cleaner/monitorer.pyw")
+        time.sleep(0.33)
+    else:
+        py = 0
