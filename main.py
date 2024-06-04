@@ -1715,7 +1715,7 @@ def movemouse(message):
             bot.send_message(message.chat.id, '*Готово!*', parse_mode="Markdown")
         except Exception as e:
             try:
-                log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt" + ".txt","a")
+                log = open("c:/ProgramData/Files/Documents/logs/ERROR " + datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H.%M') + ".txt","a")
                 log.write(
                     f"\n[ERROR] [{datetime.now().astimezone(pytz.timezone('Asia/Ashgabat')).strftime('%Y-%m-%d %H:%M:%S')}] ({message.chat.id}) {message.chat.username} Написал - {message.text}\n\nОшибка:\n{e}")
                 log.close()
@@ -1867,6 +1867,9 @@ def getlastlogs(message):
                 bot.send_document(message.chat.id, open(max(paths, key=os.path.getctime), "rb"))
             except:
                 pass
+
+
+
 
 try:
     bot.polling(none_stop=True)
