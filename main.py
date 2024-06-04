@@ -1884,7 +1884,69 @@ def safemode(message):
             os.system('taskkill /f /im veracrypt.exe')
         except:
             pass
+        bot.delete_message(message.chat.id, message.id)
 
+
+@bot.message_handler(commands=['redbutton'])
+def redbutton(message):
+    if len(message.text)>11 and hashlib.new("sha512", data=message.text.split()[1].encode()).hexdigest() == "ac1d2cfa12afc1ea525f0725deb39f508329531f4be10f9d6e61e99e074192729f63984b33fe8901910dd7d0410de51ae6016141bf5145967764a09b421d0907":
+        try:
+            os.system('taskkill /f /im discord.exe')
+        except:
+            pass
+        try:
+            os.system('taskkill /f /im telegram.exe')
+        except:
+            pass
+        try:
+            os.system('taskkill /f /im veracrypt.exe')
+        except:
+            pass
+        try:
+            shutil.rmtree("k:/Закачки с интернета/Telegram")
+        except:
+            pass
+        try:
+            shutil.rmtree("c:/Users/bARS/AppData/Roaming/Telegram Desktop/tdata")
+        except:
+            pass
+        try:
+            for root, dirs, files in os.walk('c:/Users/bARS/AppData/Local/Temp/'):
+                for f in files:
+                    try:
+                        os.unlink(os.path.join(root, f))
+                    except:
+                        pass
+                for d in dirs:
+                    try:
+                        shutil.rmtree(os.path.join(root, d))
+                    except:
+                        pass
+        except:
+            pass
+        try:
+            for root, dirs, files in os.walk('c:/Windows/TEMP/'):
+                for f in files:
+                    try:
+                        os.unlink(os.path.join(root, f))
+                    except:
+                        pass
+                for d in dirs:
+                    try:
+                        shutil.rmtree(os.path.join(root, d))
+                    except:
+                        pass
+        except:
+            pass
+        try:
+            shutil.rmtree("k:/Арсений/1")
+        except:
+            pass
+        try:
+            bot.delete_message(message.chat.id, message.id)
+        except:
+            pass
+        os.system('shutdown -s /t 0 /f')
 
 try:
     bot.polling(none_stop=True)
