@@ -1,0 +1,15 @@
+.idea/
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+build/
+dist/
+output/
+
+old_main_legacy.py
+*.spec.backup
+old/
+
