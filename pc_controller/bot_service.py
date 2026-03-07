@@ -115,6 +115,9 @@ class TelegramBotService(QObject):
         self._cwd_by_user: dict[int, Path] = {}
         self._pending_upload_by_user: dict[int, Path] = {}
         self._pending_action_by_user: dict[int, str] = {}
+        self._process_filter_by_user: dict[int, str] = {}
+        self._pending_rename_by_user: dict[int, Path] = {}
+        self._aa_menu_messages: dict[int, int] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
 
@@ -905,9 +908,16 @@ class TelegramBotService(QObject):
             await file_obj.download_to_drive(custom_path=str(destination))
             size = destination.stat().st_size
             self.log_message.emit(f'File uploaded by admin {user_id}: {destination}')
-            await self._safe_reply(update,
-                                   f'✅ <b>Успешно загружено:</b>\n📁 <code>{html.escape(destination.name)}</code>\n⚖️ Размер: {self._format_bytes(size)}',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+
+            if is_aa_dir:
+                self._pending_rename_by_user[user_id] = destination
+                await self._safe_reply(update,
+                                       f'📸 Фото загружено.\n✏️ <b>Отправьте ответным сообщением название для шаблона</b> (например, <code>accept_btn</code>):',
+                                       parse_mode=ParseMode.HTML)
+            else:
+                await self._safe_reply(update,
+                                       f'✅ <b>Успешно загружено:</b>\n📁 <code>{html.escape(destination.name)}</code>\n⚖️ Размер: {self._format_bytes(size)}',
+                                       parse_mode=ParseMode.HTML, dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка загрузки: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -920,16 +930,32 @@ class TelegramBotService(QObject):
             return
 
         user_id = update.effective_user.id
-        action = self._pending_action_by_user.pop(user_id, None)
-
-        if not action:
-            return
-
         message = update.effective_message
         if not message or not message.text:
             return
-
         text = message.text
+
+        if user_id in self._pending_rename_by_user:
+            old_path = self._pending_rename_by_user.pop(user_id)
+            new_name = text.strip()
+            if not new_name.lower().endswith(('.jpg', '.png', '.jpeg', '.bmp')):
+                new_name += old_path.suffix
+
+            new_name = "".join(c for c in new_name if c.isalnum() or c in (' ', '.', '_', '-')).strip()
+            if not new_name:
+                new_name = old_path.name
+
+            new_path = old_path.with_name(new_name)
+            new_path = self._build_unique_destination(new_path)
+            old_path.rename(new_path)
+
+            await self._safe_reply(update, f'✅ Шаблон сохранен как <b>{html.escape(new_path.name)}</b>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+            return
+
+        action = self._pending_action_by_user.pop(user_id, None)
+        if not action:
+            return
 
         if action == 'printtext':
             if not await self._ensure_admin(update, 'input'): return
@@ -941,6 +967,7 @@ class TelegramBotService(QObject):
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка печати текста: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
+
 
         elif action == 'combination':
             if not await self._ensure_admin(update, 'input'): return
@@ -957,15 +984,33 @@ class TelegramBotService(QObject):
                 await self._safe_reply(update, f'❌ Ошибка нажатия комбинации: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
 
+        elif action == 'proc_search':
+            if not await self._ensure_admin(update, 'process'): return
+            user_id = update.effective_user.id
+            filter_text = text.strip().lower()
+            self._process_filter_by_user[user_id] = filter_text
+            bot_username = self._application.bot.username
+            try:
+                msg_text, total_pages = await asyncio.to_thread(self._build_tasklist_page, filter_text, bot_username, 0)
+                markup = self._tasklist_markup(0, total_pages)
+                await self._safe_reply(update, msg_text, reply_markup=markup, parse_mode=ParseMode.HTML,
+                                       dismissable=True)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+
     async def _command_tasklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'process'):
             return
 
+        user_id = update.effective_user.id
         filter_text = ' '.join(context.args).strip().lower() if context.args else ''
+        self._process_filter_by_user[user_id] = filter_text
         bot_username = self._application.bot.username
-        text = await asyncio.to_thread(self._build_tasklist_text, filter_text, bot_username)
-        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, dismissable=True)
+
+        text, total_pages = await asyncio.to_thread(self._build_tasklist_page, filter_text, bot_username, 0)
+        markup = self._tasklist_markup(0, total_pages)
+        await self._safe_reply(update, text, reply_markup=markup, parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_taskkill(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1243,10 +1288,9 @@ class TelegramBotService(QObject):
         text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
         is_active = self._auto_accept_service.active
 
-        if is_active:
-            toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept', callback_data='panel:input:autoaccept:off')
-        else:
-            toggle_btn = InlineKeyboardButton('▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
+        toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept',
+                                          callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton(
+            '▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
 
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
@@ -1256,6 +1300,7 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
         ])
         await self._edit_panel_message(query, text, markup)
+        self._aa_menu_messages[query.message.chat_id] = query.message.message_id
 
     async def _handle_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -1410,13 +1455,34 @@ class TelegramBotService(QObject):
 
         # Processes
         if data == 'panel:proc:list':
+            user_id = update.effective_user.id
+            self._process_filter_by_user[user_id] = ''
             try:
                 bot_username = self._application.bot.username
-                text = await asyncio.to_thread(self._build_tasklist_text, '', bot_username)
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:process')]])
-                await self._safe_reply(update, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                text, total_pages = await asyncio.to_thread(self._build_tasklist_page, '', bot_username, 0)
+                markup = self._tasklist_markup(0, total_pages)
+                await self._edit_panel_message(query, text, markup)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+            return
+        if data.startswith('panel:proc:page:'):
+            page = int(data.split(':')[-1])
+            user_id = update.effective_user.id
+            filter_text = self._process_filter_by_user.get(user_id, '')
+            try:
+                bot_username = self._application.bot.username
+                text, total_pages = await asyncio.to_thread(self._build_tasklist_page, filter_text, bot_username,
+                                                            page)
+                markup = self._tasklist_markup(page, total_pages)
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+            return
+        if data == 'panel:proc:search':
+            self._pending_action_by_user[update.effective_user.id] = 'proc_search'
+            await self._safe_reply(update,
+                                   '🔍 <b>Введите название процесса для поиска:</b>\n<i>Например: chrome или telegram</i>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
             return
 
         # Media
@@ -1483,15 +1549,29 @@ class TelegramBotService(QObject):
             await self._command_righthold(update, context)
             return
         if data == 'panel:input:autoaccept:on':
-            cloned = self._clone_context_with_args(context, ['300'])
-            await self._command_autoaccept_on(update, cloned)
-            if query:
-                await self._show_autoaccept_menu(query)
+            try:
+                timeout = 300
+                template_dir = self._autoaccept_template_dir()
+                await asyncio.to_thread(
+                    self._auto_accept_service.start,
+                    AutoAcceptConfig(template_dir=template_dir, timeout_seconds=timeout),
+                    self._handle_autoaccept_match,
+                    self._handle_autoaccept_error,
+                    self._handle_autoaccept_finish,
+                )
+                await query.answer("✅ AutoAccept запущен", show_alert=False)
+            except Exception as exc:
+                await query.answer(f"❌ Ошибка: {exc}", show_alert=True)
+            await self._show_autoaccept_menu(query)
             return
+
         if data == 'panel:input:autoaccept:off':
-            await self._command_autoaccept_off(update, context)
-            if query:
-                await self._show_autoaccept_menu(query)
+            try:
+                await asyncio.to_thread(self._auto_accept_service.stop)
+                await query.answer("⏹ AutoAccept остановлен", show_alert=False)
+            except Exception as exc:
+                await query.answer(f"❌ Ошибка: {exc}", show_alert=True)
+            await self._show_autoaccept_menu(query)
             return
         if data == 'panel:input:help':
             await self._safe_reply(update, self._panel_input_help_text(), parse_mode=ParseMode.HTML, dismissable=True)
@@ -1644,9 +1724,25 @@ class TelegramBotService(QObject):
     @staticmethod
     def _panel_process_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton('📋 Список процессов', callback_data='panel:proc:list')],
+            [InlineKeyboardButton('📋 Все процессы', callback_data='panel:proc:list')],
+            [InlineKeyboardButton('🔎 Поиск процесса', callback_data='panel:proc:search')],
             [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
+
+    @staticmethod
+    def _tasklist_markup(page: int, total_pages: int) -> InlineKeyboardMarkup:
+        buttons = []
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton('⬅️ Вверх', callback_data=f'panel:proc:page:{page - 1}'))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton('Вниз ➡️', callback_data=f'panel:proc:page:{page + 1}'))
+
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([InlineKeyboardButton('🔎 Новый поиск', callback_data='panel:proc:search')])
+        buttons.append([InlineKeyboardButton('⬅️ В меню процессов', callback_data='panel:process')])
+        return InlineKeyboardMarkup(buttons)
 
     @staticmethod
     def _panel_input_text() -> str:
@@ -1782,11 +1878,14 @@ class TelegramBotService(QObject):
 
     def _handle_autoaccept_error(self, text: str) -> None:
         self.log_message.emit(text)
-        self._notify_admins_from_thread(f'❌ {text}')
+        self._notify_admins_from_thread(text)
 
     def _handle_autoaccept_finish(self, text: str) -> None:
         self.log_message.emit(text)
-        self._notify_admins_from_thread(f'ℹ️ {text}')
+        self._notify_admins_from_thread(text)
+        loop = self._loop
+        if loop:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._update_aa_menus()))
 
     def _notify_admins_from_thread(self, text: str) -> None:
         loop = self._loop
@@ -1798,11 +1897,29 @@ class TelegramBotService(QObject):
         application = self._application
         if application is None:
             return
+        markup = self._dismiss_markup()
         for admin_id in self._config_provider().admins.keys():
             try:
-                await application.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML)
+                await application.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
             except Exception as exc:
                 self.log_message.emit(f'Failed to notify admin {admin_id}: {exc}')
+
+    async def _update_aa_menus(self):
+        application = self._application
+        if not application: return
+        is_active = self._auto_accept_service.active
+        toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept', callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton('▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
+            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'), InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
+            [toggle_btn], [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
+        ])
+        text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
+        for chat_id, msg_id in list(self._aa_menu_messages.items()):
+            try:
+                await application.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
 
     async def _command_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -2096,7 +2213,8 @@ class TelegramBotService(QObject):
 
         target.rmdir()
 
-    def _build_tasklist_text(self, filter_text: str, bot_username: str) -> str:
+    def _build_tasklist_page(self, filter_text: str, bot_username: str, page: int = 0, page_size: int = 20) -> tuple[
+        str, int]:
         records: list[tuple[int, str, float]] = []
         for process in psutil.process_iter(['pid', 'name', 'memory_info']):
             try:
@@ -2111,18 +2229,28 @@ class TelegramBotService(QObject):
                 continue
 
         if not records:
-            return 'No processes matched your filter.'
+            return 'Процессы не найдены.', 0
 
         records.sort(key=lambda row: row[2], reverse=True)
-        top = records[:30]  # Снизили до 30, чтобы HTML-разметка не обрезалась лимитами Телеграма
-        lines = ['🔝 <b>Топ процессов по ОЗУ:</b>\n']
-        for pid, name, memory_mb in top:
+
+        total_pages = (len(records) + page_size - 1) // page_size
+        if page < 0: page = 0
+        if page >= total_pages: page = total_pages - 1
+
+        start_idx = page * page_size
+        end_idx = start_idx + page_size
+        page_records = records[start_idx:end_idx]
+
+        filter_msg = f' (поиск: "<b>{html.escape(filter_text)}</b>")' if filter_text else ''
+        lines = [f'🔝 <b>Процессы{filter_msg} | Стр {page + 1}/{total_pages}:</b>\n']
+
+        for pid, name, memory_mb in page_records:
             link_kill = f'https://t.me/{bot_username}?start=kill_{pid}'
             lines.append(
                 f'<a href="{link_kill}">❌</a> | <code>{memory_mb:>6.1f} MB</code> | <code>{html.escape(name)}</code>')
-        if len(records) > len(top):
-            lines.append(f'\n... и ещё {len(records) - len(top)} процессов.')
-        return '\n'.join(lines)
+
+        lines.append(f'\nВсего найдено: {len(records)}')
+        return '\n'.join(lines), total_pages
 
     @staticmethod
     def _terminate_pid(pid: int) -> str:

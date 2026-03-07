@@ -166,7 +166,6 @@ class AutoAcceptService:
 
         last_errors: dict[str, str] = {}
 
-        # Проверяем наличие OpenCV заранее, чтобы не ловить ошибки в цикле
         try:
             import cv2
             has_cv2 = True
@@ -180,35 +179,32 @@ class AutoAcceptService:
                 if not template_paths:
                     time.sleep(config.interval_seconds)
                     if time.monotonic() >= deadline:
-                        on_finish('Auto-accept stopped: no templates found before timeout.')
+                        on_finish('ℹ️ AutoAccept: остановлен, нет шаблонов.')
                         return
                     continue
 
                 for template_path in template_paths:
                     if self._stop_event.is_set():
-                        on_finish('Auto-accept stopped by user.')
+                        on_finish('⏹ AutoAccept: остановлен пользователем.')
                         return
                     try:
                         if has_cv2:
-                            # Пытаемся найти с 15% допуском (работает только с opencv-python)
                             point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True,
                                                                    confidence=0.85)
                         else:
-                            # 100% точный поиск (если opencv нет)
                             point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True)
 
                         if point is not None:
                             pyautogui.click(point.x, point.y)
-                            on_match(f'Auto-accept matched template: {template_path.name}')
-                            on_finish('Auto-accept completed successfully.')
+                            on_match(f'✅ AutoAccept: найден шаблон <b>{template_path.name}</b>')
+                            on_finish('✅ AutoAccept: успешно завершен.')
                             return
                     except Exception as exc:  # noqa: BLE001
-                        # Игнорируем штатное "Не найдено на экране"
                         if type(exc).__name__ == 'ImageNotFoundException' or 'image not found' in str(
                                 exc).lower() or not str(exc).strip():
                             pass
                         else:
-                            error_message = f'Auto-accept template error for {template_path.name}: {exc}'
+                            error_message = f'❌ AutoAccept ошибка ({template_path.name}): {exc}'
                             if last_errors.get(template_path.name) != error_message:
                                 on_error(error_message)
                                 last_errors[template_path.name] = error_message
@@ -216,7 +212,7 @@ class AutoAcceptService:
                     time.sleep(config.interval_seconds)
 
                 if time.monotonic() >= deadline:
-                    on_finish('Auto-accept timeout reached.')
+                    on_finish('ℹ️ AutoAccept: время ожидания вышло.')
                     return
         finally:
             self._active = False
