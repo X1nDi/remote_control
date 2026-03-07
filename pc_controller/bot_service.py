@@ -282,10 +282,9 @@ class TelegramBotService(QObject):
                             msg_id = self._menu_msg_id_by_user.get(user_id)
                             if msg_id:
                                 bot_username = context.bot.username
-                                text = await asyncio.to_thread(self._build_interactive_dir_listing, user_id, target,
-                                                               bot_username)
-                                markup = InlineKeyboardMarkup(
-                                    [[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+                                text, total_pages = await asyncio.to_thread(self._build_interactive_dir_page, user_id,
+                                                                            target, bot_username, 0)
+                                markup = self._files_list_markup(0, total_pages)
                                 try:
                                     await context.bot.edit_message_text(chat_id=user_id, message_id=msg_id, text=text,
                                                                         reply_markup=markup, parse_mode=ParseMode.HTML)
@@ -775,12 +774,11 @@ class TelegramBotService(QObject):
         try:
             target = self._resolve_user_path(user_id, raw_path)
             bot_username = self._application.bot.username
-            text = await asyncio.to_thread(self._build_interactive_dir_listing, user_id, target, bot_username)
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+            text, total_pages = await asyncio.to_thread(self._build_interactive_dir_page, user_id, target, bot_username, 0)
+            markup = self._files_list_markup(0, total_pages)
             await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as exc:
-            await self._safe_reply(update, f'❌ Ошибка /ls: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка /ls: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_cd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1507,11 +1505,26 @@ class TelegramBotService(QObject):
             try:
                 target = self._resolve_user_path(user_id, None)
                 bot_username = self._application.bot.username
-                text = await asyncio.to_thread(self._build_interactive_dir_listing, user_id, target, bot_username)
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+                text, total_pages = await asyncio.to_thread(self._build_interactive_dir_page, user_id, target,
+                                                            bot_username, 0)
+                markup = self._files_list_markup(0, total_pages)
                 await self._edit_panel_message(query, text, markup)
             except Exception as exc:
                 await query.answer(f'Ошибка чтения: {exc}', show_alert=True)
+            return
+
+        if data.startswith('panel:files:page:'):
+            page = int(data.split(':')[-1])
+            user_id = update.effective_user.id
+            try:
+                target = self._resolve_user_path(user_id, None)
+                bot_username = self._application.bot.username
+                text, total_pages = await asyncio.to_thread(self._build_interactive_dir_page, user_id, target,
+                                                            bot_username, page)
+                markup = self._files_list_markup(page, total_pages)
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(f'Ошибка: {exc}', show_alert=True)
             return
 
         if data == 'panel:files:pwd':
@@ -2284,33 +2297,83 @@ class TelegramBotService(QObject):
         except ValueError:
             return False
 
-    def _build_interactive_dir_listing(self, user_id: int, target: Path, bot_username: str) -> str:
+    @staticmethod
+    def _files_list_markup(page: int, total_pages: int) -> InlineKeyboardMarkup:
+        buttons = []
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton('⬅️ Вверх', callback_data=f'panel:files:page:{page - 1}'))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton('Вниз ➡️', callback_data=f'panel:files:page:{page + 1}'))
+
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')])
+        return InlineKeyboardMarkup(buttons)
+
+    def _get_fast_dir_size(self, path: Path) -> tuple[int, bool]:
+        total = 0
+        count = 0
+        is_limited = False
+
+        def scan(p):
+            nonlocal total, count, is_limited
+            try:
+                for entry in os.scandir(p):
+                    if count >= 300:
+                        is_limited = True
+                        return
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                        count += 1
+                    elif entry.is_dir(follow_symlinks=False):
+                        scan(entry.path)
+            except Exception:
+                pass
+
+        scan(str(path))
+        return total, is_limited
+
+    def _build_interactive_dir_page(self, user_id: int, target: Path, bot_username: str, page: int = 0,
+                                    page_size: int = 25) -> tuple[str, int]:
         if not target.exists():
-            raise ValueError('Path does not exist.')
+            raise ValueError('Папка не существует.')
 
         entries = sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
         self._dir_items_by_user[user_id] = [e.name for e in entries]
 
-        limit = min(len(entries), 50)
-        lines = [f'📂 <b>Текущая папка:</b>\n<code>{html.escape(str(target))}</code>\n']
+        total_pages = (len(entries) + page_size - 1) // page_size if entries else 1
+        if page < 0: page = 0
+        if page >= total_pages: page = total_pages - 1
+
+        start_idx = page * page_size
+        end_idx = start_idx + page_size
+        page_entries = entries[start_idx:end_idx]
+
+        lines = [f'📂 <b>Папка:</b>\n<code>{html.escape(str(target))}</code>']
+        lines.append(f'📄 Стр {page + 1} из {total_pages} (Элементов: {len(entries)})\n')
 
         up_link = f'https://t.me/{bot_username}?start=cdup'
         lines.append(f'⬆️ <a href="{up_link}">.. (На уровень выше)</a>\n')
 
-        for i, entry in enumerate(entries[:limit]):
+        for entry in page_entries:
+            i = entries.index(entry)
             rm_link = f'https://t.me/{bot_username}?start=rmf_{i}'
+            safe_name = html.escape(entry.name)
+
             if entry.is_dir():
                 action_link = f'https://t.me/{bot_username}?start=cd_{i}'
-                lines.append(f'<a href="{rm_link}">❌</a> 📁 <a href="{action_link}">{html.escape(entry.name)}</a>')
+                dir_size, is_limited = self._get_fast_dir_size(entry)
+                size_str = f">{self._format_bytes(dir_size)}" if is_limited else self._format_bytes(dir_size)
+                lines.append(
+                    f'<a href="{rm_link}">❌</a> 📁 <a href="{action_link}"><code>{safe_name}</code></a> <code>[{size_str}]</code>')
             else:
                 action_link = f'https://t.me/{bot_username}?start=dl_{i}'
                 size_str = self._format_bytes(entry.stat().st_size)
                 lines.append(
-                    f'<a href="{rm_link}">❌</a> 📄 <a href="{action_link}">{html.escape(entry.name)}</a> <code>{size_str}</code>')
+                    f'<a href="{rm_link}">❌</a> 📄 <a href="{action_link}"><code>{safe_name}</code></a> <code>[{size_str}]</code>')
 
-        if len(entries) > limit:
-            lines.append(f'\n... и ещё {len(entries) - limit} элементов.')
-        return '\n'.join(lines)
+        return '\n'.join(lines), total_pages
 
     def _build_aa_listing_text(self, target: Path, bot_username: str) -> str:
         if not target.exists():
