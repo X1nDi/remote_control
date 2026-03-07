@@ -118,6 +118,7 @@ class TelegramBotService(QObject):
         self._process_filter_by_user: dict[int, str] = {}
         self._pending_rename_by_user: dict[int, Path] = {}
         self._aa_menu_messages: dict[int, int] = {}
+        self._menu_msg_id_by_user: dict[int, int] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
 
@@ -990,11 +991,26 @@ class TelegramBotService(QObject):
             filter_text = text.strip().lower()
             self._process_filter_by_user[user_id] = filter_text
             bot_username = self._application.bot.username
+            msg_id = self._menu_msg_id_by_user.get(user_id)
             try:
                 msg_text, total_pages = await asyncio.to_thread(self._build_tasklist_page, filter_text, bot_username, 0)
                 markup = self._tasklist_markup(0, total_pages)
-                await self._safe_reply(update, msg_text, reply_markup=markup, parse_mode=ParseMode.HTML,
-                                       dismissable=True)
+                if msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=msg_id,
+                            text=msg_text,
+                            reply_markup=markup,
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        await self._safe_reply(update, msg_text, reply_markup=markup, parse_mode=ParseMode.HTML,
+                                               dismissable=True)
+                else:
+
+                    await self._safe_reply(update, msg_text, reply_markup=markup, parse_mode=ParseMode.HTML,
+                                           dismissable=True)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
 
@@ -1480,9 +1496,24 @@ class TelegramBotService(QObject):
             return
         if data == 'panel:proc:search':
             self._pending_action_by_user[update.effective_user.id] = 'proc_search'
-            await self._safe_reply(update,
-                                   '🔍 <b>Введите название процесса для поиска:</b>\n<i>Например: chrome или telegram</i>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('Отмена', callback_data='panel:proc:cancel_search')]])
+            await self._edit_panel_message(query,
+                                           '🔍 <b>Введите название процесса для поиска:</b>\n<i>Например: chrome или telegram</i>',
+                                           markup)
+            return
+
+        if data == 'panel:proc:cancel_search':
+            self._pending_action_by_user.pop(update.effective_user.id, None)
+            bot_username = self._application.bot.username
+            user_id = update.effective_user.id
+            filter_text = self._process_filter_by_user.get(user_id, '')
+            try:
+                text, total_pages = await asyncio.to_thread(self._build_tasklist_page, filter_text, bot_username, 0)
+                markup = self._tasklist_markup(0, total_pages)
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
             return
 
         # Media
@@ -1878,11 +1909,14 @@ class TelegramBotService(QObject):
 
     def _handle_autoaccept_error(self, text: str) -> None:
         self.log_message.emit(text)
-        self._notify_admins_from_thread(text)
+        self._notify_admins_from_thread(f'❌ {text}')
 
     def _handle_autoaccept_finish(self, text: str) -> None:
         self.log_message.emit(text)
-        self._notify_admins_from_thread(text)
+        # Отправляем в чат ТОЛЬКО если это не ручная остановка и не штатное завершение
+        if "остановлен пользователем" not in text and "успешно завершен" not in text:
+            self._notify_admins_from_thread(text)
+
         loop = self._loop
         if loop:
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self._update_aa_menus()))

@@ -185,7 +185,7 @@ class AutoAcceptService:
 
                 for template_path in template_paths:
                     if self._stop_event.is_set():
-                        on_finish('⏹ AutoAccept: остановлен пользователем.')
+                        on_finish('AutoAccept: остановлен пользователем.')
                         return
                     try:
                         if has_cv2:
@@ -196,15 +196,15 @@ class AutoAcceptService:
 
                         if point is not None:
                             pyautogui.click(point.x, point.y)
-                            on_match(f'✅ AutoAccept: найден шаблон <b>{template_path.name}</b>')
-                            on_finish('✅ AutoAccept: успешно завершен.')
+                            on_match(f'AutoAccept: найден шаблон <b>{template_path.name}</b>')
+                            on_finish('AutoAccept: успешно завершен.')
                             return
                     except Exception as exc:  # noqa: BLE001
                         if type(exc).__name__ == 'ImageNotFoundException' or 'image not found' in str(
                                 exc).lower() or not str(exc).strip():
                             pass
                         else:
-                            error_message = f'❌ AutoAccept ошибка ({template_path.name}): {exc}'
+                            error_message = f'AutoAccept ошибка ({template_path.name}): {exc}'
                             if last_errors.get(template_path.name) != error_message:
                                 on_error(error_message)
                                 last_errors[template_path.name] = error_message
