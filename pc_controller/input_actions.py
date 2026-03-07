@@ -74,10 +74,14 @@ def right_hold(duration_seconds: float = 2.0) -> CommandResult:
     return CommandResult(True, f'Right button held for {duration_seconds:.1f}s.')
 
 
-def move_mouse(x: int, y: int, duration_seconds: float = 0.15) -> CommandResult:
+def move_mouse(x: int, y: int, duration_seconds: float = 0.15, relative: bool = False) -> CommandResult:
     _ensure_pyautogui()
-    pyautogui.moveTo(x=x, y=y, duration=max(0.0, min(duration_seconds, 5.0)))
-    return CommandResult(True, f'Mouse moved to ({x}, {y}).')
+    if relative:
+        pyautogui.move(xOffset=x, yOffset=y, duration=max(0.0, min(duration_seconds, 5.0)))
+        return CommandResult(True, f'Mouse moved relatively by ({x}, {y}).')
+    else:
+        pyautogui.moveTo(x=x, y=y, duration=max(0.0, min(duration_seconds, 5.0)))
+        return CommandResult(True, f'Mouse moved to ({x}, {y}).')
 
 
 def show_message(text: str, title: str = 'PC Controller') -> CommandResult:

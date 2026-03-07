@@ -171,15 +171,15 @@ class TelegramBotService(QObject):
         if admin_str not in admins:
             self.log_message.emit(f'Access denied for user_id={user_id}')
             await self._safe_reply(update, '❌ Доступ запрещен. Ваш Telegram ID не найден в списке администраторов.',
-                                   dismissable=True)
+                                   show_alert=True)
             return False
 
         if required_perm:
             perms = admins[admin_str]
             has_perm = getattr(perms, required_perm, False)
             if not has_perm:
-                await self._safe_reply(update, '❌ У вас нет прав на использование этой категории команд.',
-                                       dismissable=True, as_toast=True)
+                await self._safe_reply(update, '❌ У вас нет прав на эту категорию кнопок!',
+                                       show_alert=True)
                 return False
 
         return True
@@ -1069,6 +1069,28 @@ class TelegramBotService(QObject):
                 await self._safe_reply(update, f'❌ Ошибка нажатия комбинации: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
 
+        elif action == 'message':
+            if not await self._ensure_admin(update, 'input'): return
+            try:
+                result = await asyncio.to_thread(show_message, text)
+                self.log_message.emit(result.message)
+                await self._safe_reply(update, f'💬 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: <code>{html.escape(str(exc))}</code>',
+                                       parse_mode=ParseMode.HTML, dismissable=True)
+
+        elif action == 'voice':
+            if not await self._ensure_admin(update, 'input'): return
+            try:
+                result = await asyncio.to_thread(speak_text, text)
+                self.log_message.emit(result.message)
+                await self._safe_reply(update, f'🗣 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: <code>{html.escape(str(exc))}</code>',
+                                       parse_mode=ParseMode.HTML, dismissable=True)
+
         elif action == 'proc_search':
             if not await self._ensure_admin(update, 'process'): return
             user_id = update.effective_user.id
@@ -1330,10 +1352,14 @@ class TelegramBotService(QObject):
             return
 
         try:
-            x = int(context.args[0])
-            y = int(context.args[1])
+            x_str = context.args[0]
+            y_str = context.args[1]
+            is_relative = x_str.startswith(('+', '-')) or y_str.startswith(('+', '-'))
+
+            x = int(x_str)
+            y = int(y_str)
             duration = float(context.args[2]) if len(context.args) > 2 else 0.15
-            result = await asyncio.to_thread(move_mouse, x, y, duration)
+            result = await asyncio.to_thread(move_mouse, x, y, duration, relative=is_relative)
             self.log_message.emit(result.message)
             await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
                                    dismissable=True)
@@ -1667,6 +1693,17 @@ class TelegramBotService(QObject):
             await self._safe_reply(update, '🔠 <b>Отправь комбинацию клавиш</b> (например: win d, ctrl c):',
                                    parse_mode=ParseMode.HTML, dismissable=True)
             return
+        if data == 'panel:input:msg':
+            self._pending_action_by_user[update.effective_user.id] = 'message'
+            await self._safe_reply(update,
+                                   '💬 <b>Отправьте текст</b>, который должен появиться во всплывающем окне на ПК:',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+            return
+        if data == 'panel:input:voice':
+            self._pending_action_by_user[update.effective_user.id] = 'voice'
+            await self._safe_reply(update, '🗣 <b>Отправьте текст</b>, который ПК должен произнести голосом:',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+            return
         if data == 'panel:input:showdesk':
             cloned = self._clone_context_with_args(context, ['win', 'd'])
             await self._command_combination(update, cloned)
@@ -1716,7 +1753,8 @@ class TelegramBotService(QObject):
             await self._show_autoaccept_menu(query)
             return
         if data == 'panel:input:help':
-            await self._safe_reply(update, self._panel_input_help_text(), parse_mode=ParseMode.HTML, dismissable=True)
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]])
+            await self._edit_panel_message(query, self._panel_input_help_text(), markup)
             return
 
         # Power
@@ -1896,6 +1934,8 @@ class TelegramBotService(QObject):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('✏️ Свой Текст', callback_data='panel:input:custom_text'),
              InlineKeyboardButton('🔠 Свои Клавиши', callback_data='panel:input:custom_combo')],
+            [InlineKeyboardButton('💬 Всплывающее Сообщение', callback_data='panel:input:msg'),
+             InlineKeyboardButton('🗣 Озвучить текст', callback_data='panel:input:voice')],
             [InlineKeyboardButton('🖥 Свернуть окна', callback_data='panel:input:showdesk'),
              InlineKeyboardButton('🪟 Alt + Tab', callback_data='panel:input:alttab')],
             [InlineKeyboardButton('🖱 ЛКМ', callback_data='panel:input:leftclick'),
@@ -1986,7 +2026,7 @@ class TelegramBotService(QObject):
             '• Медиа — фото, видео, аудио.\n'
             '• Питание — lock, sleep, hibernate, выключение.\n'
             '• Логи — чтение файла логов.\n\n'
-            'Полный список команд также доступен через <code>/help</code>.'
+            'Полный список команд также доступен через /help'
         )
 
     @staticmethod
@@ -2081,7 +2121,8 @@ class TelegramBotService(QObject):
                                    parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _safe_reply(self, update: Update, text: str, reply_markup: InlineKeyboardMarkup | None = None,
-                          parse_mode: str | None = None, dismissable: bool = False, as_toast: bool = False) -> None:
+                          parse_mode: str | None = None, dismissable: bool = False, as_toast: bool = False,
+                          show_alert: bool = False) -> None:
         chat = update.effective_chat
         if chat is None:
             return
@@ -2098,13 +2139,12 @@ class TelegramBotService(QObject):
         is_timeout = 'timed out' in text.lower() or 'timeout' in text.lower()
 
         if query and query.message:
-            if as_toast or is_timeout:
+            if as_toast or is_timeout or show_alert:
                 try:
                     clean_text = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>',
                                                                                                            '').replace(
                         '❌ ', '')
-                    # При таймауте показываем Alert (show_alert=True), для обычных toast просто всплывашку снизу
-                    await query.answer(clean_text[:200], show_alert=is_timeout)
+                    await query.answer(clean_text[:200], show_alert=is_timeout or show_alert)
                 except Exception:
                     pass
                 # Строго выходим: не изменяем сообщение на текст ошибки и не шлем новое

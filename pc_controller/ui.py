@@ -356,7 +356,7 @@ class InstallDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Первый запуск PC Controller")
         self.setModal(True)
-        self.setFixedSize(560, 240)
+        self.setFixedSize(560, 270)
         self.setStyleSheet(APP_STYLE)
 
         self.action = "leave"
@@ -381,6 +381,15 @@ class InstallDialog(QDialog):
         path_layout.addWidget(self.path_edit, stretch=1)
         path_layout.addWidget(self.browse_btn)
 
+        self.chk_desktop = QCheckBox("Добавить ярлык на рабочий стол")
+        self.chk_desktop.setChecked(True)
+        self.chk_start_menu = QCheckBox("Добавить ярлык в меню Пуск")
+        self.chk_start_menu.setChecked(True)
+
+        options_layout = QVBoxLayout()
+        options_layout.addWidget(self.chk_desktop)
+        options_layout.addWidget(self.chk_start_menu)
+
         btn_layout = QHBoxLayout()
         self.install_btn = QPushButton("Установить сюда")
         self.leave_btn = QPushButton("Оставить где есть")
@@ -396,16 +405,14 @@ class InstallDialog(QDialog):
         layout.addWidget(title)
         layout.addWidget(desc)
         layout.addLayout(path_layout)
+        layout.addLayout(options_layout)
         layout.addStretch()
         layout.addLayout(btn_layout)
 
     def _browse(self):
-        file_name, _ = QFileDialog.getSaveFileName(
-            self,
-            "Выберите куда сохранить программу",
-            str(self.chosen_path),
-            "Executable (*.exe)" if getattr(sys, 'frozen', False) else "Python Script (*.py)"
-        )
+        file_name, _ = QFileDialog.getSaveFileName(self, "Выберите куда сохранить программу", str(self.chosen_path),
+                                                   "Executable (*.exe)" if getattr(sys, 'frozen',
+                                                                                   False) else "Python Script (*.py)")
         if file_name:
             self.chosen_path = Path(file_name)
             self.path_edit.setText(str(self.chosen_path))
@@ -466,9 +473,6 @@ class MainWindow(QMainWindow):
 
         self._load_config_into_form()
 
-        if not self._config.installed:
-            QTimer.singleShot(100, self._show_install_prompt)
-
         if self._config.auto_start_bot:
             QTimer.singleShot(600, lambda: self.start_bot(save_before_start=False))
 
@@ -478,35 +482,6 @@ class MainWindow(QMainWindow):
 
     def show_toast(self, message: str):
         ToastWidget(self, message)
-
-    def _show_install_prompt(self):
-        if self._config.installed:
-            return
-
-        dialog = InstallDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            if dialog.action == "install":
-                target_path = dialog.chosen_path
-                try:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    if getattr(sys, 'frozen', False):
-                        import shutil
-                        shutil.copy2(sys.executable, target_path)
-                    else:
-                        import shutil
-                        shutil.copy2(sys.argv[0], target_path)
-
-                    self._config.installed = True
-                    self.config_manager.save(self._config)
-
-                    subprocess.Popen([str(target_path)])
-                    QApplication.instance().quit()
-                    return
-                except Exception as e:
-                    QMessageBox.warning(self, "Ошибка", f"Не удалось скопировать файл:\n{e}")
-
-            self._config.installed = True
-            self.config_manager.save(self._config)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -1260,32 +1235,48 @@ def check_first_run_and_install():
     if CONFIG_PATH.exists():
         return
 
-    msg = QMessageBox()
-    msg.setWindowTitle("Первый запуск PC Controller")
-    msg.setText("Похоже, вы запускаете программу впервые.\nХотите установить её в систему?")
-    msg.setInformativeText(
-        f"Рекомендуется скопировать файлы в:\n{default_install_dir}\n\nЕсли нажать 'Оставить здесь', программа будет работать портативно.")
-    msg.setStyleSheet(APP_STYLE)
+    dialog = InstallDialog()
+    dialog.exec()
 
-    btn_install = msg.addButton("Установить (Рекомендуется)", QMessageBox.ButtonRole.AcceptRole)
-    btn_portable = msg.addButton("Оставить здесь", QMessageBox.ButtonRole.RejectRole)
-
-    msg.exec()
-
-    if msg.clickedButton() == btn_install:
-        target_dir = default_install_dir
+    if dialog.action == "install":
+        target_dir = dialog.chosen_path.parent
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
             if getattr(sys, 'frozen', False):
-                target_exe = target_dir / current_path.name
+                target_exe = dialog.chosen_path
                 import shutil
                 shutil.copy2(current_path, target_exe)
-                subprocess.Popen([str(target_exe)])
+                installed_path = target_exe
             else:
                 import shutil
                 shutil.copytree(current_path, target_dir, dirs_exist_ok=True)
-                run_file = target_dir / current_path.name if current_path.is_file() else target_dir / 'ui.py'
-                subprocess.Popen([sys.executable, str(run_file)])
+                installed_path = target_dir / current_path.name if current_path.is_file() else target_dir / 'main.py'
+
+            if dialog.chk_desktop.isChecked() or dialog.chk_start_menu.isChecked():
+                try:
+                    from win32com.client import Dispatch
+                    shell = Dispatch('WScript.Shell')
+
+                    if dialog.chk_desktop.isChecked():
+                        desktop = Path(shell.SpecialFolders("Desktop"))
+                        shortcut = shell.CreateShortCut(str(desktop / "PC Controller.lnk"))
+                        shortcut.Targetpath = str(installed_path)
+                        shortcut.WorkingDirectory = str(installed_path.parent)
+                        shortcut.save()
+
+                    if dialog.chk_start_menu.isChecked():
+                        programs = Path(shell.SpecialFolders("Programs"))
+                        shortcut = shell.CreateShortCut(str(programs / "PC Controller.lnk"))
+                        shortcut.Targetpath = str(installed_path)
+                        shortcut.WorkingDirectory = str(installed_path.parent)
+                        shortcut.save()
+                except Exception as e:
+                    print(f"Не удалось создать ярлыки: {e}")
+
+            if getattr(sys, 'frozen', False):
+                subprocess.Popen([str(installed_path)])
+            else:
+                subprocess.Popen([sys.executable, str(installed_path)])
             sys.exit(0)
         except Exception as e:
             QMessageBox.critical(None, "Ошибка", f"Не удалось скопировать файлы:\n{e}")
