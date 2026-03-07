@@ -119,6 +119,7 @@ class TelegramBotService(QObject):
         self._pending_rename_by_user: dict[int, Path] = {}
         self._aa_menu_messages: dict[int, int] = {}
         self._menu_msg_id_by_user: dict[int, int] = {}
+        self._dir_items_by_user: dict[int, list[str]] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
 
@@ -188,55 +189,146 @@ class TelegramBotService(QObject):
         if not await self._ensure_admin(update):
             return
 
-        if context.args and context.args[0].startswith('aa_'):
-            encoded = context.args[0][3:]
-            try:
-                padding = '=' * (4 - len(encoded) % 4)
-                filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
-                target = self._autoaccept_template_dir() / filename
-                if target.exists() and target.is_file():
-                    with target.open('rb') as f:
-                        await update.effective_chat.send_photo(
-                            photo=f,
-                            caption=f'📸 <b>Шаблон:</b> <code>{html.escape(filename)}</code>',
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=self._dismiss_markup()
-                        )
+        if context.args:
+            arg = context.args[0]
+
+            if arg.startswith('aa_'):
+                encoded = arg[3:]
+                try:
+                    padding = '=' * (4 - len(encoded) % 4)
+                    filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
+                    target = self._autoaccept_template_dir() / filename
+                    if target.exists() and target.is_file():
+                        with target.open('rb') as f:
+                            await update.effective_chat.send_photo(
+                                photo=f,
+                                caption=f'📸 <b>Шаблон:</b> <code>{html.escape(filename)}</code>',
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=self._dismiss_markup()
+                            )
+                        return
+                    else:
+                        await self._safe_reply(update, "❌ Файл шаблона больше не существует.", dismissable=True,
+                                               as_toast=True)
+                        return
+                except Exception as e:
+                    await self._safe_reply(update, f"❌ Ошибка чтения файла: {e}", dismissable=True, as_toast=True)
                     return
-                else:
-                    await self._safe_reply(update, "❌ Файл шаблона больше не существует.", dismissable=True, as_toast=True)
-                    return
-            except Exception as e:
-                await self._safe_reply(update, f"❌ Ошибка чтения файла: {e}", dismissable=True, as_toast=True)
+
+            if arg.startswith('rmaa_'):
+                encoded = arg[5:]
+                try:
+                    padding = '=' * (4 - len(encoded) % 4)
+                    filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
+                    target = self._autoaccept_template_dir() / filename
+                    if target.exists() and target.is_file():
+                        target.unlink()
+                        await self._safe_reply(update, f'🗑 Шаблон <b>{html.escape(filename)}</b> удален.',
+                                               parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                    else:
+                        await self._safe_reply(update, '❌ Шаблон не найден.', dismissable=True, as_toast=True)
+                except Exception as exc:
+                    await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
                 return
 
-        if context.args and context.args[0].startswith('rmaa_'):
-            encoded = context.args[0][5:]
-            try:
-                padding = '=' * (4 - len(encoded) % 4)
-                filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
-                target = self._autoaccept_template_dir() / filename
-                if target.exists() and target.is_file():
-                    target.unlink()
-                    await self._safe_reply(update, f'🗑 Шаблон <b>{html.escape(filename)}</b> удален.',
-                                           parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
-                else:
-                    await self._safe_reply(update, '❌ Шаблон не найден.', dismissable=True, as_toast=True)
-            except Exception as exc:
-                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
-            return
+            if arg.startswith('kill_'):
+                if not await self._ensure_admin(update, 'process'): return
+                pid_str = arg[5:]
+                try:
+                    pid = int(pid_str)
+                    message = await asyncio.to_thread(self._terminate_pid, pid)
+                    await self._safe_reply(update, f'☠️ <b>{html.escape(message)}</b>', parse_mode=ParseMode.HTML,
+                                           dismissable=True, as_toast=True)
+                except Exception as exc:
+                    await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+                return
 
-        if context.args and context.args[0].startswith('kill_'):
-            if not await self._ensure_admin(update, 'process'): return
-            pid_str = context.args[0][5:]
-            try:
-                pid = int(pid_str)
-                message = await asyncio.to_thread(self._terminate_pid, pid)
-                await self._safe_reply(update, f'☠️ <b>{html.escape(message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True, as_toast=True)
-            except Exception as exc:
-                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
-            return
+            if arg.startswith('rmf_'):
+                if not await self._ensure_admin(update, 'files'): return
+                user_id = update.effective_user.id
+                idx = int(arg[4:])
+                items = self._dir_items_by_user.get(user_id, [])
+                if 0 <= idx < len(items):
+                    filename = items[idx]
+                    text = f'⚠️ <b>Подтверждение удаления:</b>\nВы действительно хотите удалить <code>{html.escape(filename)}</code>?'
+                    markup = InlineKeyboardMarkup([
+                        [InlineKeyboardButton('✅ Подтвердить', callback_data=f'panel:files:rm_yes:{idx}'),
+                         InlineKeyboardButton('❌ Отмена', callback_data='panel:files:ls')]
+                    ])
+                    msg_id = self._menu_msg_id_by_user.get(user_id)
+                    if msg_id:
+                        try:
+                            await context.bot.edit_message_text(chat_id=user_id, message_id=msg_id, text=text,
+                                                                reply_markup=markup, parse_mode=ParseMode.HTML)
+                        except Exception:
+                            pass
+                return
+
+            if arg == 'cdup' or arg.startswith('cd_'):
+                if not await self._ensure_admin(update, 'files'): return
+                user_id = update.effective_user.id
+                if arg == 'cdup':
+                    target_name = '..'
+                else:
+                    idx = int(arg[3:])
+                    items = self._dir_items_by_user.get(user_id, [])
+                    target_name = items[idx] if 0 <= idx < len(items) else None
+
+                if target_name:
+                    try:
+                        target = self._resolve_user_path(user_id, target_name)
+                        if target.exists() and target.is_dir():
+                            self._cwd_by_user[user_id] = target
+                            msg_id = self._menu_msg_id_by_user.get(user_id)
+                            if msg_id:
+                                bot_username = context.bot.username
+                                text = await asyncio.to_thread(self._build_interactive_dir_listing, user_id, target,
+                                                               bot_username)
+                                markup = InlineKeyboardMarkup(
+                                    [[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+                                try:
+                                    await context.bot.edit_message_text(chat_id=user_id, message_id=msg_id, text=text,
+                                                                        reply_markup=markup, parse_mode=ParseMode.HTML)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                return
+
+            if arg.startswith('dl_'):
+                if not await self._ensure_admin(update, 'files'): return
+                user_id = update.effective_user.id
+                idx = int(arg[3:])
+                items = self._dir_items_by_user.get(user_id, [])
+                if 0 <= idx < len(items):
+                    target_name = items[idx]
+                    try:
+                        target = self._resolve_user_path(user_id, target_name)
+                        if target.exists() and target.is_file():
+                            size = target.stat().st_size
+                            if size > 45 * 1024 * 1024:
+                                raise ValueError('Файл слишком большой (>45MB).')
+                            temp_msg = await self._send_temporary_status(update, '⏳ <b>Отправка файла...</b>')
+                            try:
+                                with target.open('rb') as f:
+                                    suf = target.suffix.lower()
+                                    if suf in {'.png', '.jpg', '.jpeg', '.bmp'}:
+                                        await update.effective_chat.send_photo(photo=f,
+                                                                               caption=html.escape(target.name),
+                                                                               reply_markup=self._dismiss_markup())
+                                    elif suf in {'.mp4', '.avi', '.mov', '.mkv'}:
+                                        await update.effective_chat.send_video(video=f,
+                                                                               caption=html.escape(target.name),
+                                                                               reply_markup=self._dismiss_markup())
+                                    else:
+                                        await update.effective_chat.send_document(document=f, filename=target.name,
+                                                                                  caption=html.escape(target.name),
+                                                                                  reply_markup=self._dismiss_markup())
+                            finally:
+                                await self._delete_message_safe(temp_msg)
+                    except Exception as e:
+                        await self._safe_reply(update, f'❌ Ошибка: {e}', dismissable=True)
+                return
 
         await self._safe_reply(update, HELP_TEXT, reply_markup=self._panel_main_markup(), parse_mode=ParseMode.HTML)
 
@@ -645,9 +737,7 @@ class TelegramBotService(QObject):
 
     async def _command_pwd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update, 'files'):
-            return
-
+        if not await self._ensure_admin(update, 'files'): return
         user_id = update.effective_user.id
         allow_all = self._config_provider().allow_all_files
         root = self._base_root()
@@ -657,18 +747,16 @@ class TelegramBotService(QObject):
             self._cwd_by_user[user_id] = root
 
         root_text = "ВСЕ ДИСКИ" if allow_all else html.escape(str(root))
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
         await self._safe_reply(update,
                                f'📂 <b>Корень:</b> <code>{root_text}</code>\n📍 <b>Текущая папка:</b> <code>{html.escape(str(cwd))}</code>',
-                               parse_mode=ParseMode.HTML, dismissable=True)
+                               parse_mode=ParseMode.HTML, reply_markup=markup)
 
     async def _command_drives(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update, 'files'):
-            return
-
+        if not await self._ensure_admin(update, 'files'): return
         if not self._config_provider().allow_all_files:
-            await self._safe_reply(update, '❌ Отключено. Включите "Полный доступ ко всем дискам" в настройках UI.',
-                                   dismissable=True, as_toast=True)
+            await self._safe_reply(update, '❌ Отключено.', dismissable=True, as_toast=True)
             return
 
         drives = [p.mountpoint for p in psutil.disk_partitions() if p.fstype]
@@ -676,20 +764,20 @@ class TelegramBotService(QObject):
         for d in drives:
             text += f"• <code>{d}</code> (Используйте <code>/cd {d}</code>)\n"
 
-        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, dismissable=True)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     async def _command_ls(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update, 'files'):
-            return
-
+        if not await self._ensure_admin(update, 'files'): return
         user_id = update.effective_user.id
         raw_path = ' '.join(context.args).strip() if context.args else ''
         try:
             target = self._resolve_user_path(user_id, raw_path)
-            text = await asyncio.to_thread(self._build_dir_listing_text, target)
-            await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
+            bot_username = self._application.bot.username
+            text = await asyncio.to_thread(self._build_interactive_dir_listing, user_id, target, bot_username)
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+            await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /ls: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -828,9 +916,7 @@ class TelegramBotService(QObject):
 
     async def _command_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update, 'files'):
-            return
-
+        if not await self._ensure_admin(update, 'files'): return
         user_id = update.effective_user.id
         raw_path = ' '.join(context.args).strip() if context.args else ''
         try:
@@ -838,14 +924,14 @@ class TelegramBotService(QObject):
             if not target_dir.exists() or not target_dir.is_dir():
                 raise ValueError('Target directory does not exist.')
             self._pending_upload_by_user[user_id] = target_dir
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
             await self._safe_reply(
                 update,
-                f'📤 <b>Режим загрузки включен для:</b>\n<code>{html.escape(str(target_dir))}</code>\n\nПрикрепите файл или фото в чат прямо сейчас.\nИспользуйте /cancelupload для отмены.',
-                parse_mode=ParseMode.HTML, dismissable=True
+                f'📤 <b>Режим загрузки включен для:</b>\n<code>{html.escape(str(target_dir))}</code>\n\nПрикрепите документ или медиа в чат.',
+                parse_mode=ParseMode.HTML, reply_markup=markup
             )
         except Exception as exc:
-            await self._safe_reply(update, f'❌ Ошибка /upload: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка /upload: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_cancel_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1402,20 +1488,34 @@ class TelegramBotService(QObject):
             return
 
         # Files
-        if data == 'panel:files:pwd':
-            await self._command_pwd(update, context)
-            return
+        if data.startswith('panel:files:rm_yes:'):
+            idx = int(data.split(':')[-1])
+            user_id = update.effective_user.id
+            items = self._dir_items_by_user.get(user_id, [])
+            if 0 <= idx < len(items):
+                try:
+                    target = self._resolve_user_path(user_id, items[idx])
+                    await asyncio.to_thread(self._remove_path, target, True)
+                    await query.answer(f'Удалено: {items[idx]}', show_alert=False)
+                except Exception as exc:
+                    await query.answer(f'Ошибка: {exc}', show_alert=True)
+            data = 'panel:files:ls'
+
         if data == 'panel:files:ls':
             user_id = update.effective_user.id
+            self._menu_msg_id_by_user[user_id] = query.message.message_id
             try:
                 target = self._resolve_user_path(user_id, None)
-                text = await asyncio.to_thread(self._build_dir_listing_text, target)
+                bot_username = self._application.bot.username
+                text = await asyncio.to_thread(self._build_interactive_dir_listing, user_id, target, bot_username)
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
-                await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', reply_markup=markup,
-                                       parse_mode=ParseMode.HTML)
+                await self._edit_panel_message(query, text, markup)
             except Exception as exc:
-                await self._safe_reply(update, f'❌ Ошибка чтения: <code>{html.escape(str(exc))}</code>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
+                await query.answer(f'Ошибка чтения: {exc}', show_alert=True)
+            return
+
+        if data == 'panel:files:pwd':
+            await self._command_pwd(update, context)
             return
         if data == 'panel:files:drives':
             await self._command_drives(update, context)
@@ -1424,14 +1524,12 @@ class TelegramBotService(QObject):
             user_id = update.effective_user.id
             cwd = self._resolve_user_path(user_id, None)
             self._pending_upload_by_user[user_id] = cwd
-            await self._safe_reply(
-                update,
-                f'📤 <b>Режим загрузки включен для:</b>\n<code>{html.escape(str(cwd))}</code>\n\nПрикрепите документ в чат. /cancelupload для отмены.',
-                parse_mode=ParseMode.HTML, dismissable=True
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+            await self._edit_panel_message(
+                query,
+                f'📤 <b>Режим загрузки включен для:</b>\n<code>{html.escape(str(cwd))}</code>\n\nПрикрепите документ или медиа в чат.',
+                markup
             )
-            return
-        if data == 'panel:files:cancelupload':
-            await self._command_cancel_upload(update, context)
             return
 
         # AutoAccept File Management
@@ -1745,8 +1843,7 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('📍 Текущая папка', callback_data='panel:files:pwd'),
              InlineKeyboardButton('📚 Список файлов', callback_data='panel:files:ls')],
             [InlineKeyboardButton('📤 Загрузить сюда', callback_data='panel:files:upload'),
-             InlineKeyboardButton('✋ Отмена', callback_data='panel:files:cancelupload')],
-            [InlineKeyboardButton('💾 Список дисков', callback_data='panel:files:drives')],
+             InlineKeyboardButton('💾 Список дисков', callback_data='panel:files:drives')],
             [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
@@ -2187,26 +2284,32 @@ class TelegramBotService(QObject):
         except ValueError:
             return False
 
-    def _build_dir_listing_text(self, target: Path) -> str:
+    def _build_interactive_dir_listing(self, user_id: int, target: Path, bot_username: str) -> str:
         if not target.exists():
             raise ValueError('Path does not exist.')
 
-        if target.is_file():
-            size = target.stat().st_size
-            return f'📄 File:\n{target}\nSize: {self._format_bytes(size)}'
-
         entries = sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
-        lines = [f'📂 Directory: {target}', f'📊 Items: {len(entries)}']
-        limit = min(len(entries), MAX_LIST_ITEMS)
-        for entry in entries[:limit]:
-            icon = '📁' if entry.is_dir() else '📄'
+        self._dir_items_by_user[user_id] = [e.name for e in entries]
+
+        limit = min(len(entries), 50)
+        lines = [f'📂 <b>Текущая папка:</b>\n<code>{html.escape(str(target))}</code>\n']
+
+        up_link = f'https://t.me/{bot_username}?start=cdup'
+        lines.append(f'⬆️ <a href="{up_link}">.. (На уровень выше)</a>\n')
+
+        for i, entry in enumerate(entries[:limit]):
+            rm_link = f'https://t.me/{bot_username}?start=rmf_{i}'
             if entry.is_dir():
-                details = '<DIR>'
+                action_link = f'https://t.me/{bot_username}?start=cd_{i}'
+                lines.append(f'<a href="{rm_link}">❌</a> 📁 <a href="{action_link}">{html.escape(entry.name)}</a>')
             else:
-                details = self._format_bytes(entry.stat().st_size)
-            lines.append(f'{icon} {entry.name}  ({details})')
+                action_link = f'https://t.me/{bot_username}?start=dl_{i}'
+                size_str = self._format_bytes(entry.stat().st_size)
+                lines.append(
+                    f'<a href="{rm_link}">❌</a> 📄 <a href="{action_link}">{html.escape(entry.name)}</a> <code>{size_str}</code>')
+
         if len(entries) > limit:
-            lines.append(f'... and {len(entries) - limit} more items.')
+            lines.append(f'\n... и ещё {len(entries) - limit} элементов.')
         return '\n'.join(lines)
 
     def _build_aa_listing_text(self, target: Path, bot_username: str) -> str:
