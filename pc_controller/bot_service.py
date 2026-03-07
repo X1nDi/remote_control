@@ -2366,12 +2366,12 @@ class TelegramBotService(QObject):
                 dir_size, is_limited = self._get_fast_dir_size(entry)
                 size_str = f">{self._format_bytes(dir_size)}" if is_limited else self._format_bytes(dir_size)
                 lines.append(
-                    f'<a href="{rm_link}">❌</a> 📁 <a href="{action_link}"><code>{safe_name}</code></a> <code>[{size_str}]</code>')
+                    f'<a href="{rm_link}">❌</a> 📁 <a href="{action_link}">{safe_name}</a> <code>[{size_str}]</code>')
             else:
                 action_link = f'https://t.me/{bot_username}?start=dl_{i}'
                 size_str = self._format_bytes(entry.stat().st_size)
                 lines.append(
-                    f'<a href="{rm_link}">❌</a> 📄 <a href="{action_link}"><code>{safe_name}</code></a> <code>[{size_str}]</code>')
+                    f'<a href="{rm_link}">❌</a> 📄 <a href="{action_link}">{safe_name}</a> <code>[{size_str}]</code>')
 
         return '\n'.join(lines), total_pages
 
