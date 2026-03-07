@@ -1069,27 +1069,41 @@ class TelegramBotService(QObject):
                 await self._safe_reply(update, f'❌ Ошибка нажатия комбинации: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
 
-        elif action == 'message':
+        elif action in ('message', 'voice'):
             if not await self._ensure_admin(update, 'input'): return
+            user_id = update.effective_user.id
+            msg_id = self._menu_msg_id_by_user.get(user_id)
+            if msg_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=msg_id,
+                        text='⏳ <b>Выполняю...</b>',
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
             try:
-                result = await asyncio.to_thread(show_message, text)
+                if action == 'message':
+                    result = await asyncio.to_thread(show_message, text)
+                else:
+                    result = await asyncio.to_thread(speak_text, text)
                 self.log_message.emit(result.message)
-                await self._safe_reply(update, f'💬 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
-
-        elif action == 'voice':
-            if not await self._ensure_admin(update, 'input'): return
-            try:
-                result = await asyncio.to_thread(speak_text, text)
-                self.log_message.emit(result.message)
-                await self._safe_reply(update, f'🗣 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True)
-            except Exception as exc:
-                await self._safe_reply(update, f'❌ Ошибка: <code>{html.escape(str(exc))}</code>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
+            finally:
+                if msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=msg_id,
+                            text=self._panel_input_text(),
+                            reply_markup=self._panel_input_markup(),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
 
         elif action == 'proc_search':
             if not await self._ensure_admin(update, 'process'): return
@@ -1695,14 +1709,24 @@ class TelegramBotService(QObject):
             return
         if data == 'panel:input:msg':
             self._pending_action_by_user[update.effective_user.id] = 'message'
-            await self._safe_reply(update,
-                                   '💬 <b>Отправьте текст</b>, который должен появиться во всплывающем окне на ПК:',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')]])
+            await self._edit_panel_message(query,
+                                           '💬 <b>Отправьте текст</b>, который должен появиться во всплывающем окне на ПК:',
+                                           markup)
             return
         if data == 'panel:input:voice':
             self._pending_action_by_user[update.effective_user.id] = 'voice'
-            await self._safe_reply(update, '🗣 <b>Отправьте текст</b>, который ПК должен произнести голосом:',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')]])
+            await self._edit_panel_message(query, '🗣 <b>Отправьте текст</b>, который ПК должен произнести голосом:',
+                                           markup)
+            return
+        if data == 'panel:input:cancel_text':
+            self._pending_action_by_user.pop(update.effective_user.id, None)
+            await self._edit_panel_message(query, self._panel_input_text(), self._panel_input_markup())
             return
         if data == 'panel:input:showdesk':
             cloned = self._clone_context_with_args(context, ['win', 'd'])
