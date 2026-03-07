@@ -1705,7 +1705,9 @@ class TelegramBotService(QObject):
     async def _edit_panel_message(self, query, text: str, markup: InlineKeyboardMarkup) -> None:
         try:
             await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-        except Exception:
+        except Exception as e:
+            if 'Message is not modified' in str(e):
+                return  # Игнорируем ошибку, так как меню уже обновилось
             if query.message:
                 await query.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
@@ -2005,7 +2007,9 @@ class TelegramBotService(QObject):
                     await chat.send_message(chunk, reply_markup=reply_markup if chunk == chunks[-1] else None,
                                             parse_mode=parse_mode)
                 return
-            except Exception:
+            except Exception as e:
+                if 'Message is not modified' in str(e):
+                    return  # Прерываем отправку дубля
                 pass
 
         # Если это тайм-аут, но мы дошли сюда (например, ответ не удался) — все равно прерываем
