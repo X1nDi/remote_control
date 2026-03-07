@@ -190,7 +190,7 @@ class AutoAcceptService:
                     try:
                         if has_cv2:
                             point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True,
-                                                                   confidence=0.85)
+                                                                   confidence=0.7)
                         else:
                             point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True)
 
