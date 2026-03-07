@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import os
+import re
 import shutil
 import threading
 import time
@@ -63,9 +65,7 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 🔸 /help - Показать все команды
 🔸 /myid - Твой Telegram ID
 🔸 /ping - Проверка связи
-🔸 /status - Статус приложения и ПК
 🔸 /uptime - Время работы системы
-🔸 /screenshot - Скриншот рабочего стола
 
 🎥 <b>Медиа:</b>
 🔸 /webcam - Фото с веб-камеры
@@ -78,19 +78,20 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 🔸 /hibernate - Гибернация
 🔸 /shutdown [sec] - Выключение
 🔸 /reboot [sec] - Перезагрузка
-🔸 /cancelshutdown - Отменить действия питания
+🔸 /cancelshutdown - Отмена питания
 
 🗂 <b>Файлы:</b>
 🔸 /pwd, /ls, /cd, /mkdir, /rm, /rmr
 🔸 /download, /upload, /cancelupload
+🔸 /drives - Список всех дисков
 
 ⚙️ <b>Процессы:</b>
 🔸 /tasklist [filter] - Список
-🔸 /taskkill &lt;pid&gt; - Завершить
+🔸 /kill_PID - Быстрое завершение (PID)
 
 ⌨️ <b>Ввод и управление:</b>
-🔸 /printtext &lt;text&gt; - Напечатать текст
-🔸 /combination &lt;keys...&gt; - Горячие клавиши
+🔸 /printtext &lt;text&gt;
+🔸 /combination &lt;keys...&gt;
 🔸 /movemouse &lt;x&gt; &lt;y&gt; [sec]
 🔸 /message, /voice
 🔸 /autoaccepton, /autoacceptoff
@@ -130,8 +131,8 @@ class TelegramBotService(QObject):
         if not config.bot_token.strip():
             self.log_message.emit('Bot token is empty. Set it in settings first.')
             return
-        if not config.admin_ids:
-            self.log_message.emit('Admin IDs list is empty. Add at least one admin ID.')
+        if not config.admins:
+            self.log_message.emit('Admins list is empty. Add at least one admin.')
             return
 
         self._stop_event.clear()
@@ -154,10 +155,85 @@ class TelegramBotService(QObject):
             self._thread.join(timeout=4)
         self._thread = None
 
+    async def _ensure_admin(self, update: Update, required_perm: str | None = None) -> bool:
+        user = update.effective_user
+        user_id = getattr(user, 'id', None)
+        if user_id is None:
+            return False
+
+        admin_str = str(user_id)
+        admins = self._config_provider().admins
+        if admin_str not in admins:
+            self.log_message.emit(f'Access denied for user_id={user_id}')
+            await self._safe_reply(update, '❌ Доступ запрещен. Ваш Telegram ID не найден в списке администраторов.',
+                                   dismissable=True)
+            return False
+
+        if required_perm:
+            perms = admins[admin_str]
+            has_perm = getattr(perms, required_perm, False)
+            if not has_perm:
+                await self._safe_reply(update, '❌ У вас нет прав на использование этой категории команд.',
+                                       dismissable=True, as_toast=True)
+                return False
+
+        return True
+
     async def _command_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update):
             return
+
+        if context.args and context.args[0].startswith('aa_'):
+            encoded = context.args[0][3:]
+            try:
+                padding = '=' * (4 - len(encoded) % 4)
+                filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
+                target = self._autoaccept_template_dir() / filename
+                if target.exists() and target.is_file():
+                    with target.open('rb') as f:
+                        await update.effective_chat.send_photo(
+                            photo=f,
+                            caption=f'📸 <b>Шаблон:</b> <code>{html.escape(filename)}</code>',
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=self._dismiss_markup()
+                        )
+                    return
+                else:
+                    await self._safe_reply(update, "❌ Файл шаблона больше не существует.", dismissable=True, as_toast=True)
+                    return
+            except Exception as e:
+                await self._safe_reply(update, f"❌ Ошибка чтения файла: {e}", dismissable=True, as_toast=True)
+                return
+
+        if context.args and context.args[0].startswith('rmaa_'):
+            encoded = context.args[0][5:]
+            try:
+                padding = '=' * (4 - len(encoded) % 4)
+                filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
+                target = self._autoaccept_template_dir() / filename
+                if target.exists() and target.is_file():
+                    target.unlink()
+                    await self._safe_reply(update, f'🗑 Шаблон <b>{html.escape(filename)}</b> удален.',
+                                           parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                else:
+                    await self._safe_reply(update, '❌ Шаблон не найден.', dismissable=True, as_toast=True)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+            return
+
+        if context.args and context.args[0].startswith('kill_'):
+            if not await self._ensure_admin(update, 'process'): return
+            pid_str = context.args[0][5:]
+            try:
+                pid = int(pid_str)
+                message = await asyncio.to_thread(self._terminate_pid, pid)
+                await self._safe_reply(update, f'☠️ <b>{html.escape(message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True, as_toast=True)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+            return
+
         await self._safe_reply(update, HELP_TEXT, reply_markup=self._panel_main_markup(), parse_mode=ParseMode.HTML)
 
     async def _command_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -175,13 +251,15 @@ class TelegramBotService(QObject):
         user = update.effective_user
         if user is None:
             return
-        await self._safe_reply(update, f'🪪 Твой Telegram ID: <code>{user.id}</code>', parse_mode=ParseMode.HTML, dismissable=True)
+        await self._safe_reply(update, f'🪪 Твой Telegram ID: <code>{user.id}</code>', parse_mode=ParseMode.HTML,
+                               dismissable=True)
 
     async def _command_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update):
             return
-        await self._safe_reply(update, '🟢 <b>Pong!</b> Связь с ПК установлена.', parse_mode=ParseMode.HTML, dismissable=True)
+        await self._safe_reply(update, '🟢 <b>Pong!</b> Связь с ПК установлена.', parse_mode=ParseMode.HTML,
+                               dismissable=True)
 
     async def _command_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -191,15 +269,15 @@ class TelegramBotService(QObject):
         config = self._config_provider()
         snapshot = await asyncio.to_thread(
             collect_snapshot,
-            len(config.admin_ids),
+            len(config.admins),
             config.autostart,
             self._running,
         )
 
         text = (
-            f"🌟 <b>Статус системы</b> 🌟\n\n"
+            f"🌟 <b>Обзор системы</b> 🌟\n\n"
             f"💻 <b>Хост:</b> <code>{html.escape(snapshot.hostname)}</code> ({html.escape(snapshot.os_name)} {html.escape(snapshot.os_release)})\n"
-            f"🌐 <b>IP:</b> <code>{html.escape(snapshot.ip_address)}</code>\n"
+            f"🌐 <b>Public IP:</b> <code>{html.escape(snapshot.ip_address)}</code>\n"
             f"🐍 <b>Python:</b> <code>{html.escape(snapshot.python_version)}</code>\n"
             f"🧠 <b>CPU:</b> <code>{snapshot.cpu_percent:.1f}%</code>\n"
             f"💽 <b>RAM:</b> <code>{snapshot.memory_percent:.1f}%</code>\n"
@@ -220,7 +298,7 @@ class TelegramBotService(QObject):
         config = self._config_provider()
         snapshot = await asyncio.to_thread(
             collect_snapshot,
-            len(config.admin_ids),
+            len(config.admins),
             config.autostart,
             self._running,
         )
@@ -232,58 +310,91 @@ class TelegramBotService(QObject):
         if not await self._ensure_admin(update):
             return
 
-        temp_msg = await self._send_temporary_status(update, '⏳ <b>Делаю скриншот...</b>')
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text('⏳ <b>Делаю скриншот...</b>', parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, '⏳ <b>Делаю скриншот...</b>')
+
         try:
             screenshot_bytes, file_name = await asyncio.to_thread(capture_screenshot_bytes)
+
+            if query:
+                await query.edit_message_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await temp_msg.edit_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+
             stream = BytesIO(screenshot_bytes)
             stream.name = file_name
             if update.effective_chat:
                 await update.effective_chat.send_photo(
-                    photo=stream, 
-                    caption='🖼 <b>Текущий скриншот рабочего стола</b>', 
-                    parse_mode=ParseMode.HTML, 
+                    photo=stream,
+                    caption='🖼 <b>Текущий скриншот рабочего стола</b>',
+                    parse_mode=ParseMode.HTML,
                     reply_markup=self._dismiss_markup(),
-                    read_timeout=60, 
+                    read_timeout=60,
                     write_timeout=60
                 )
             self.log_message.emit(f'Screenshot sent to admin {update.effective_user.id}.')
         except Exception as exc:
             self.log_message.emit(f'Failed to capture screenshot: {exc}')
             await self._safe_reply(update, f'❌ Ошибка создания скриншота: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         finally:
-            await self._delete_message_safe(temp_msg)
+            if query:
+                await query.edit_message_text(self._panel_main_text(), reply_markup=self._panel_main_markup(),
+                                              parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await self._delete_message_safe(temp_msg)
 
     async def _command_webcam(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
+        if not await self._ensure_admin(update, 'media'):
             return
 
-        temp_msg = await self._send_temporary_status(update, '⏳ <b>Делаю фото с веб-камеры...</b>')
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text('⏳ <b>Делаю фото с веб-камеры...</b>', parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, '⏳ <b>Делаю фото с веб-камеры...</b>')
+
         try:
             from .system_metrics import capture_webcam_photo
             photo_bytes, file_name = await asyncio.to_thread(capture_webcam_photo)
+
+            if query:
+                await query.edit_message_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await temp_msg.edit_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+
             stream = BytesIO(photo_bytes)
             stream.name = file_name
             if update.effective_chat:
                 await update.effective_chat.send_photo(
-                    photo=stream, 
-                    caption='📸 <b>Фото с веб-камеры</b>', 
-                    parse_mode=ParseMode.HTML, 
+                    photo=stream,
+                    caption='📸 <b>Фото с веб-камеры</b>',
+                    parse_mode=ParseMode.HTML,
                     reply_markup=self._dismiss_markup(),
-                    read_timeout=60, 
+                    read_timeout=60,
                     write_timeout=60
                 )
             self.log_message.emit(f'Webcam photo sent to admin {update.effective_user.id}.')
         except Exception as exc:
             self.log_message.emit(f'Failed to capture webcam: {exc}')
-            await self._safe_reply(update, f'❌ Ошибка камеры: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка камеры: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         finally:
-            await self._delete_message_safe(temp_msg)
+            if query:
+                await query.edit_message_text(self._panel_media_text(), reply_markup=self._panel_media_markup(),
+                                              parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await self._delete_message_safe(temp_msg)
 
     async def _command_webcamvid(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
+        if not await self._ensure_admin(update, 'media'):
             return
 
         duration = 5
@@ -292,32 +403,49 @@ class TelegramBotService(QObject):
                 duration = max(1, min(60, int(context.args[0])))
             except ValueError:
                 pass
-                
-        temp_msg = await self._send_temporary_status(update, f'⏳ <b>Записываю видео с веб-камеры ({duration}с)...</b>')
+
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text(f'⏳ <b>Запись видео ({duration}с)...</b>', parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, f'⏳ <b>Запись видео ({duration}с)...</b>')
+
         try:
             from .system_metrics import capture_webcam_video
             video_bytes, file_name = await asyncio.to_thread(capture_webcam_video, duration)
+
+            if query:
+                await query.edit_message_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await temp_msg.edit_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+
             stream = BytesIO(video_bytes)
             stream.name = file_name
             if update.effective_chat:
                 await update.effective_chat.send_video(
-                    video=stream, 
-                    caption=f'🎥 <b>Видео с веб-камеры ({duration}с)</b>', 
-                    parse_mode=ParseMode.HTML, 
+                    video=stream,
+                    caption=f'🎥 <b>Видео с веб-камеры ({duration}с)</b>',
+                    parse_mode=ParseMode.HTML,
                     reply_markup=self._dismiss_markup(),
-                    read_timeout=120, 
+                    read_timeout=120,
                     write_timeout=120
                 )
             self.log_message.emit(f'Webcam video sent to admin {update.effective_user.id}.')
         except Exception as exc:
             self.log_message.emit(f'Failed to capture webcam video: {exc}')
-            await self._safe_reply(update, f'❌ Ошибка камеры: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка камеры: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         finally:
-            await self._delete_message_safe(temp_msg)
+            if query:
+                await query.edit_message_text(self._panel_media_text(), reply_markup=self._panel_media_markup(),
+                                              parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await self._delete_message_safe(temp_msg)
 
     async def _command_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
+        if not await self._ensure_admin(update, 'media'):
             return
 
         duration = 5
@@ -326,38 +454,56 @@ class TelegramBotService(QObject):
                 duration = max(1, min(60, int(context.args[0])))
             except ValueError:
                 pass
-                
-        temp_msg = await self._send_temporary_status(update, f'⏳ <b>Записываю аудио ({duration}с)...</b>')
+
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text(f'⏳ <b>Записываю аудио ({duration}с)...</b>', parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, f'⏳ <b>Записываю аудио ({duration}с)...</b>')
+
         try:
             from .system_metrics import record_audio
             audio_bytes, file_name = await asyncio.to_thread(record_audio, duration)
+
+            if query:
+                await query.edit_message_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await temp_msg.edit_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+
             stream = BytesIO(audio_bytes)
             stream.name = file_name
             if update.effective_chat:
                 await update.effective_chat.send_voice(
-                    voice=stream, 
-                    caption=f'🎙 <b>Аудиозапись ({duration}с)</b>', 
-                    parse_mode=ParseMode.HTML, 
+                    voice=stream,
+                    caption=f'🎙 <b>Аудиозапись ({duration}с)</b>',
+                    parse_mode=ParseMode.HTML,
                     reply_markup=self._dismiss_markup(),
-                    read_timeout=120, 
+                    read_timeout=120,
                     write_timeout=120
                 )
             self.log_message.emit(f'Audio sent to admin {update.effective_user.id}.')
         except Exception as exc:
             self.log_message.emit(f'Failed to record audio: {exc}')
-            await self._safe_reply(update, f'❌ Ошибка записи аудио: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка записи аудио: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         finally:
-            await self._delete_message_safe(temp_msg)
+            if query:
+                await query.edit_message_text(self._panel_media_text(), reply_markup=self._panel_media_markup(),
+                                              parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await self._delete_message_safe(temp_msg)
 
     async def _command_lock(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
+        if not await self._ensure_admin(update, 'power'):
             return
 
         try:
             result = await asyncio.to_thread(lock_workstation)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🔒 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🔒 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             self.log_message.emit(f'Lock command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка блокировки: <code>{html.escape(str(exc))}</code>',
@@ -365,17 +511,15 @@ class TelegramBotService(QObject):
 
     async def _command_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'power'):
             return
 
         try:
             delay = parse_delay(context.args[0] if context.args else None)
             result = await asyncio.to_thread(schedule_shutdown, delay)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'⏻ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'⏻ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except ValueError as exc:
             await self._safe_reply(update,
                                    f'Использование: <code>/shutdown [seconds]</code>\nОшибка: {html.escape(str(exc))}',
@@ -387,17 +531,15 @@ class TelegramBotService(QObject):
 
     async def _command_reboot(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'power'):
             return
 
         try:
             delay = parse_delay(context.args[0] if context.args else None)
             result = await asyncio.to_thread(schedule_reboot, delay)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except ValueError as exc:
             await self._safe_reply(update,
                                    f'Использование: <code>/reboot [seconds]</code>\nОшибка: {html.escape(str(exc))}',
@@ -409,10 +551,7 @@ class TelegramBotService(QObject):
 
     async def _command_cancel_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'power'):
             return
 
         try:
@@ -432,27 +571,36 @@ class TelegramBotService(QObject):
 
     async def _command_sleep(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'power'):
             return
 
         try:
             result = await asyncio.to_thread(sleep_system)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🌙 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🌙 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             self.log_message.emit(f'Sleep command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка перехода в сон: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
 
+    async def _command_hibernate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'power'):
+            return
+
+        try:
+            result = await asyncio.to_thread(hibernate_system)
+            self.log_message.emit(result.message)
+            await self._safe_reply(update, f'❄️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка гибернации: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+
     async def _command_open_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_open_url_command:
-            await self._safe_reply(update, '❌ Команда открытия ссылок отключена в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'open_url'):
             return
 
         if not context.args:
@@ -464,7 +612,8 @@ class TelegramBotService(QObject):
         try:
             result = await asyncio.to_thread(open_url, url)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🌐 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🌐 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except ValueError as exc:
             await self._safe_reply(update, f'Неверная ссылка: {html.escape(str(exc))}', dismissable=True)
         except Exception as exc:
@@ -487,32 +636,47 @@ class TelegramBotService(QObject):
                 return
 
         text = await asyncio.to_thread(self._read_log_tail, lines_count)
-        await self._safe_reply(update, f'🧾 <b>Логи:</b>\n<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML, dismissable=True)
+        await self._safe_reply(update, f'🧾 <b>Логи:</b>\n<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML,
+                               dismissable=True)
 
     async def _command_pwd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         user_id = update.effective_user.id
+        allow_all = self._config_provider().allow_all_files
         root = self._base_root()
         cwd = self._cwd_by_user.get(user_id, root)
-        if not self._is_allowed_path(cwd, root):
+        if not allow_all and not self._is_allowed_path(cwd, root):
             cwd = root
             self._cwd_by_user[user_id] = root
+
+        root_text = "ВСЕ ДИСКИ" if allow_all else html.escape(str(root))
         await self._safe_reply(update,
-                               f'📂 <b>Корень:</b> <code>{html.escape(str(root))}</code>\n📍 <b>Текущая папка:</b> <code>{html.escape(str(cwd))}</code>',
+                               f'📂 <b>Корень:</b> <code>{root_text}</code>\n📍 <b>Текущая папка:</b> <code>{html.escape(str(cwd))}</code>',
                                parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_drives(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'files'):
+            return
+
+        if not self._config_provider().allow_all_files:
+            await self._safe_reply(update, '❌ Отключено. Включите "Полный доступ ко всем дискам" в настройках UI.',
+                                   dismissable=True, as_toast=True)
+            return
+
+        drives = [p.mountpoint for p in psutil.disk_partitions() if p.fstype]
+        text = "💾 <b>Доступные диски:</b>\n\n"
+        for d in drives:
+            text += f"• <code>{d}</code> (Используйте <code>/cd {d}</code>)\n"
+
+        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_ls(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         user_id = update.effective_user.id
@@ -520,21 +684,20 @@ class TelegramBotService(QObject):
         try:
             target = self._resolve_user_path(user_id, raw_path)
             text = await asyncio.to_thread(self._build_dir_listing_text, target)
-            await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /ls: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_cd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         if not context.args:
-            await self._safe_reply(update, 'Использование: <code>/cd &lt;path&gt;</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, 'Использование: <code>/cd &lt;path&gt;</code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
 
         user_id = update.effective_user.id
@@ -553,14 +716,12 @@ class TelegramBotService(QObject):
 
     async def _command_mkdir(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         if not context.args:
-            await self._safe_reply(update, 'Использование: <code>/mkdir &lt;path&gt;</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, 'Использование: <code>/mkdir &lt;path&gt;</code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
 
         user_id = update.effective_user.id
@@ -578,14 +739,12 @@ class TelegramBotService(QObject):
 
     async def _command_rm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         if not context.args:
-            await self._safe_reply(update, 'Использование: <code>/rm &lt;path&gt;</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, 'Использование: <code>/rm &lt;path&gt;</code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
 
         user_id = update.effective_user.id
@@ -601,14 +760,12 @@ class TelegramBotService(QObject):
 
     async def _command_rmr(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         if not context.args:
-            await self._safe_reply(update, 'Использование: <code>/rmr &lt;path&gt;</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, 'Использование: <code>/rmr &lt;path&gt;</code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
 
         user_id = update.effective_user.id
@@ -624,10 +781,7 @@ class TelegramBotService(QObject):
 
     async def _command_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         if not context.args:
@@ -646,8 +800,9 @@ class TelegramBotService(QObject):
                 raise ValueError(
                     f'File is too large ({self._format_bytes(size)}). Limit is {self._format_bytes(MAX_DOWNLOAD_FILE_SIZE)}.'
                 )
-                
-            temp_msg = await self._send_temporary_status(update, f'⏳ <b>Подготовка файла {html.escape(target.name)}...</b>')
+
+            temp_msg = await self._send_temporary_status(update,
+                                                         f'⏳ <b>Подготовка файла {html.escape(target.name)}...</b>')
             try:
                 if update.effective_chat:
                     with target.open('rb') as file_stream:
@@ -669,10 +824,7 @@ class TelegramBotService(QObject):
 
     async def _command_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
-            await self._safe_reply(update, '❌ Управление файлами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'files'):
             return
 
         user_id = update.effective_user.id
@@ -699,15 +851,14 @@ class TelegramBotService(QObject):
         user_id = update.effective_user.id
         if user_id in self._pending_upload_by_user:
             self._pending_upload_by_user.pop(user_id, None)
-            await self._safe_reply(update, '✋ <b>Режим загрузки файла отменен.</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, '✋ <b>Режим загрузки файла отменен.</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
         await self._safe_reply(update, 'ℹ️ Режим загрузки файла сейчас не активен.', dismissable=True)
 
     async def _handle_document_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_file_commands:
+        if not await self._ensure_admin(update, 'files'):
             return
 
         user_id = update.effective_user.id
@@ -744,7 +895,8 @@ class TelegramBotService(QObject):
             except ValueError:
                 pass
 
-            if not is_aa_dir and not self._is_allowed_path(target_dir, root):
+            if not is_aa_dir and not self._config_provider().allow_all_files and not self._is_allowed_path(target_dir,
+                                                                                                           root):
                 raise ValueError('Upload target is outside allowed root.')
 
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -780,15 +932,18 @@ class TelegramBotService(QObject):
         text = message.text
 
         if action == 'printtext':
+            if not await self._ensure_admin(update, 'input'): return
             try:
                 result = await asyncio.to_thread(type_text, text)
                 self.log_message.emit(result.message)
-                await self._safe_reply(update, f'⌨️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+                await self._safe_reply(update, f'⌨️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка печати текста: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
 
         elif action == 'combination':
+            if not await self._ensure_admin(update, 'input'): return
             keys = self._parse_combination_args(text.split())
             if not keys:
                 await self._safe_reply(update, '❌ Клавиши не распознаны.', dismissable=True)
@@ -796,45 +951,77 @@ class TelegramBotService(QObject):
             try:
                 result = await asyncio.to_thread(press_combination, keys)
                 self.log_message.emit(result.message)
-                await self._safe_reply(update, f'🪟 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+                await self._safe_reply(update, f'🪟 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка нажатия комбинации: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_tasklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_process_commands:
-            await self._safe_reply(update, '❌ Управление процессами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'process'):
             return
 
         filter_text = ' '.join(context.args).strip().lower() if context.args else ''
-        text = await asyncio.to_thread(self._build_tasklist_text, filter_text)
-        await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML, dismissable=True)
+        bot_username = self._application.bot.username
+        text = await asyncio.to_thread(self._build_tasklist_text, filter_text, bot_username)
+        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_taskkill(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_process_commands:
-            await self._safe_reply(update, '❌ Управление процессами отключено в настройках.', dismissable=True)
+        if not await self._ensure_admin(update, 'process'):
             return
 
         if not context.args:
-            await self._safe_reply(update, 'Использование: <code>/taskkill &lt;pid&gt;</code>',
+            await self._safe_reply(update, 'Использование: <code>/taskkill <pid></code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
             return
 
         try:
             pid = int(context.args[0])
             message = await asyncio.to_thread(self._terminate_pid, pid)
-            await self._safe_reply(update, f'☠️ <b>{html.escape(message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'☠️ <b>{html.escape(message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except ValueError:
             await self._safe_reply(update, '❌ PID должен быть целым числом.', dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /taskkill: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_kill_regex(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'process'):
+            return
+
+        text = update.effective_message.text
+        pid_str = text.split('_')[1]
+        try:
+            pid = int(pid_str)
+            message = await asyncio.to_thread(self._terminate_pid, pid)
+            await self._safe_reply(update, f'☠️ <b>{html.escape(message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True, as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+
+    async def _command_rmaa_regex(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'input'):
+            return
+
+        text = update.effective_message.text
+        encoded = text.split('_', 1)[1]
+        try:
+            padding = '=' * (4 - len(encoded) % 4)
+            filename = base64.urlsafe_b64decode(encoded + padding).decode('utf-8')
+            target = self._autoaccept_template_dir() / filename
+            if target.exists() and target.is_file():
+                target.unlink()
+                await self._safe_reply(update, f'🗑 Шаблон <b>{html.escape(filename)}</b> удален.',
+                                       parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+            else:
+                await self._safe_reply(update, '❌ Шаблон не найден.', dismissable=True, as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
 
     async def _command_printtext(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -843,14 +1030,15 @@ class TelegramBotService(QObject):
 
         text = ' '.join(context.args).strip()
         if not text:
-            await self._safe_reply(update, 'Использование: <code>/printtext &lt;text&gt;</code>',
+            await self._safe_reply(update, 'Использование: <code>/printtext <text></code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
             return
 
         try:
             result = await asyncio.to_thread(type_text, text)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'⌨️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'⌨️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /printtext: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -863,14 +1051,15 @@ class TelegramBotService(QObject):
         keys = self._parse_combination_args(context.args)
         if not keys:
             await self._safe_reply(update,
-                                   'Использование: <code>/combination &lt;keys...&gt;</code>\nПример: <code>/combination win d</code>',
+                                   'Использование: <code>/combination <keys...></code>\nПример: <code>/combination win d</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
             return
 
         try:
             result = await asyncio.to_thread(press_combination, keys)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🪟 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🪟 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /combination: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -882,14 +1071,15 @@ class TelegramBotService(QObject):
 
         text = ' '.join(context.args).strip()
         if not text:
-            await self._safe_reply(update, 'Использование: <code>/message &lt;text&gt;</code>',
+            await self._safe_reply(update, 'Использование: <code>/message <text></code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
             return
 
         try:
             result = await asyncio.to_thread(show_message, text)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'💬 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'💬 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /message: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -901,13 +1091,15 @@ class TelegramBotService(QObject):
 
         text = ' '.join(context.args).strip()
         if not text:
-            await self._safe_reply(update, 'Использование: <code>/voice &lt;text&gt;</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, 'Использование: <code>/voice <text></code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
 
         try:
             result = await asyncio.to_thread(speak_text, text)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🗣 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🗣 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /voice: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -919,7 +1111,8 @@ class TelegramBotService(QObject):
         try:
             result = await asyncio.to_thread(left_click)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка клика: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -931,7 +1124,8 @@ class TelegramBotService(QObject):
         try:
             result = await asyncio.to_thread(right_click)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка клика: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -943,7 +1137,8 @@ class TelegramBotService(QObject):
         try:
             result = await asyncio.to_thread(double_left_click)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка двойного клика: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -955,7 +1150,8 @@ class TelegramBotService(QObject):
         try:
             result = await asyncio.to_thread(middle_click)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка среднего клика: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -969,7 +1165,8 @@ class TelegramBotService(QObject):
             duration = float(context.args[0]) if context.args else 2.0
             result = await asyncio.to_thread(right_hold, duration)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except ValueError:
             await self._safe_reply(update, 'Использование: <code>/righthold [seconds]</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
@@ -983,7 +1180,7 @@ class TelegramBotService(QObject):
             return
 
         if len(context.args) < 2:
-            await self._safe_reply(update, 'Использование: <code>/movemouse &lt;x&gt; &lt;y&gt; [seconds]</code>',
+            await self._safe_reply(update, 'Использование: <code>/movemouse <x> <y> [seconds]</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
             return
 
@@ -993,9 +1190,10 @@ class TelegramBotService(QObject):
             duration = float(context.args[2]) if len(context.args) > 2 else 0.15
             result = await asyncio.to_thread(move_mouse, x, y, duration)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🖱 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except ValueError:
-            await self._safe_reply(update, 'Использование: <code>/movemouse &lt;x&gt; &lt;y&gt; [seconds]</code>',
+            await self._safe_reply(update, 'Использование: <code>/movemouse <x> <y> [seconds]</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка мыши: <code>{html.escape(str(exc))}</code>',
@@ -1021,11 +1219,11 @@ class TelegramBotService(QObject):
             await self._safe_reply(
                 update,
                 f'🤖 <b>{html.escape(result.message)}</b>\n📁 Шаблоны: <code>{html.escape(str(template_dir))}</code>\n⏱ Таймаут: {timeout}с',
-                parse_mode=ParseMode.HTML, dismissable=True
+                parse_mode=ParseMode.HTML, dismissable=True, as_toast=True
             )
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /autoaccepton: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
 
     async def _command_autoaccept_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1035,26 +1233,29 @@ class TelegramBotService(QObject):
         try:
             result = await asyncio.to_thread(self._auto_accept_service.stop)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🤖 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🤖 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True, as_toast=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /autoacceptoff: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
 
-    async def _command_hibernate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._delete_user_message(update)
-        if not await self._ensure_admin(update):
-            return
-        if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True)
-            return
+    async def _show_autoaccept_menu(self, query) -> None:
+        text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
+        is_active = self._auto_accept_service.active
 
-        try:
-            result = await asyncio.to_thread(hibernate_system)
-            self.log_message.emit(result.message)
-            await self._safe_reply(update, f'❄️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
-        except Exception as exc:
-            await self._safe_reply(update, f'❌ Ошибка гибернации: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+        if is_active:
+            toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept', callback_data='panel:input:autoaccept:off')
+        else:
+            toggle_btn = InlineKeyboardButton('▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
+
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
+            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'),
+             InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
+            [toggle_btn],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
+        ])
+        await self._edit_panel_message(query, text, markup)
 
     async def _handle_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -1065,6 +1266,13 @@ class TelegramBotService(QObject):
             return
 
         data = str(query.data or '')
+
+        if data.startswith('panel:files') and not await self._ensure_admin(update, 'files'): return
+        if data.startswith('panel:proc') and not await self._ensure_admin(update, 'process'): return
+        if (data.startswith('panel:input') or data.startswith('panel:aa')) and not await self._ensure_admin(update,
+                                                                                                            'input'): return
+        if data.startswith('panel:power') and not await self._ensure_admin(update, 'power'): return
+        if data.startswith('panel:media') and not await self._ensure_admin(update, 'media'): return
 
         # Dismissal
         if data == 'panel:dismiss':
@@ -1080,9 +1288,6 @@ class TelegramBotService(QObject):
             return
         if data == 'panel:help':
             await self._edit_panel_message(query, self._panel_help_text(), self._panel_help_markup())
-            return
-        if data == 'panel:overview':
-            await self._edit_panel_message(query, self._panel_overview_text(), self._panel_overview_markup())
             return
         if data == 'panel:files':
             await self._edit_panel_message(query, self._panel_files_text(), self._panel_files_markup())
@@ -1103,24 +1308,36 @@ class TelegramBotService(QObject):
             await self._edit_panel_message(query, self._panel_logs_text(), self._panel_logs_markup())
             return
         if data == 'panel:aa:main':
-            await self._edit_panel_message(query, self._panel_autoaccept_text(), self._panel_autoaccept_markup())
+            await self._show_autoaccept_menu(query)
             return
 
         # Overview
-        if data == 'panel:status':
-            await self._command_status(update, context)
+        if data == 'panel:overview':
+            snapshot = await asyncio.to_thread(
+                collect_snapshot,
+                len(self._config_provider().admins),
+                self._config_provider().autostart,
+                self._running,
+            )
+            text = (
+                f"🌟 <b>Обзор системы</b> 🌟\n\n"
+                f"💻 <b>Хост:</b> <code>{html.escape(snapshot.hostname)}</code> ({html.escape(snapshot.os_name)} {html.escape(snapshot.os_release)})\n"
+                f"🌐 <b>Public IP:</b> <code>{html.escape(snapshot.ip_address)}</code>\n"
+                f"🐍 <b>Python:</b> <code>{html.escape(snapshot.python_version)}</code>\n"
+                f"🧠 <b>CPU:</b> <code>{snapshot.cpu_percent:.1f}%</code>\n"
+                f"💽 <b>RAM:</b> <code>{snapshot.memory_percent:.1f}%</code>\n"
+                f"💾 <b>Disk:</b> <code>{snapshot.disk_percent:.1f}%</code>\n"
+                f"⏱ <b>Uptime:</b> <code>{format_uptime(snapshot.uptime_seconds)}</code>\n"
+                f"👥 <b>Admins:</b> <code>{snapshot.admin_count}</code>\n"
+                f"🚀 <b>Autostart:</b> {'🟢 ВКЛ' if snapshot.autostart_enabled else '🔴 ВЫКЛ'}\n"
+                f"🤖 <b>Bot:</b> {'🟢 Работает' if snapshot.bot_running else '🔴 Остановлен'}"
+            )
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]])
+            await self._edit_panel_message(query, text, markup)
             return
+
         if data == 'panel:screenshot':
             await self._command_screenshot(update, context)
-            return
-        if data == 'panel:uptime':
-            await self._command_uptime(update, context)
-            return
-        if data == 'panel:ping':
-            await self._command_ping(update, context)
-            return
-        if data == 'panel:myid':
-            await self._command_myid(update, context)
             return
 
         # Files
@@ -1128,7 +1345,19 @@ class TelegramBotService(QObject):
             await self._command_pwd(update, context)
             return
         if data == 'panel:files:ls':
-            await self._command_ls(update, context)
+            user_id = update.effective_user.id
+            try:
+                target = self._resolve_user_path(user_id, None)
+                text = await asyncio.to_thread(self._build_dir_listing_text, target)
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:files')]])
+                await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', reply_markup=markup,
+                                       parse_mode=ParseMode.HTML)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка чтения: <code>{html.escape(str(exc))}</code>',
+                                       parse_mode=ParseMode.HTML, dismissable=True)
+            return
+        if data == 'panel:files:drives':
+            await self._command_drives(update, context)
             return
         if data == 'panel:files:upload':
             user_id = update.effective_user.id
@@ -1158,8 +1387,10 @@ class TelegramBotService(QObject):
         if data == 'panel:aa:ls':
             target = self._autoaccept_template_dir()
             try:
-                text = await asyncio.to_thread(self._build_dir_listing_text, target)
-                await self._safe_reply(update, f'<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML, dismissable=True)
+                bot_username = self._application.bot.username
+                text = await asyncio.to_thread(self._build_aa_listing_text, target, bot_username)
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:aa:main')]])
+                await self._safe_reply(update, text, reply_markup=markup, parse_mode=ParseMode.HTML)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка чтения: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
@@ -1171,15 +1402,21 @@ class TelegramBotService(QObject):
                     if item.is_file():
                         item.unlink()
                 await self._safe_reply(update, '🗑 <b>Все шаблоны AutoAccept успешно очищены.</b>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
+                                       parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка очистки: <code>{html.escape(str(exc))}</code>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
+                                       parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             return
 
         # Processes
         if data == 'panel:proc:list':
-            await self._command_tasklist(update, context)
+            try:
+                bot_username = self._application.bot.username
+                text = await asyncio.to_thread(self._build_tasklist_text, '', bot_username)
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:process')]])
+                await self._safe_reply(update, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            except Exception as exc:
+                await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
             return
 
         # Media
@@ -1194,12 +1431,20 @@ class TelegramBotService(QObject):
             cloned = self._clone_context_with_args(context, ['15'])
             await self._command_webcamvid(update, cloned)
             return
+        if data == 'panel:media:webcamvid60':
+            cloned = self._clone_context_with_args(context, ['60'])
+            await self._command_webcamvid(update, cloned)
+            return
         if data == 'panel:media:audio5':
             cloned = self._clone_context_with_args(context, ['5'])
             await self._command_audio(update, cloned)
             return
         if data == 'panel:media:audio15':
             cloned = self._clone_context_with_args(context, ['15'])
+            await self._command_audio(update, cloned)
+            return
+        if data == 'panel:media:audio60':
+            cloned = self._clone_context_with_args(context, ['60'])
             await self._command_audio(update, cloned)
             return
 
@@ -1240,9 +1485,13 @@ class TelegramBotService(QObject):
         if data == 'panel:input:autoaccept:on':
             cloned = self._clone_context_with_args(context, ['300'])
             await self._command_autoaccept_on(update, cloned)
+            if query:
+                await self._show_autoaccept_menu(query)
             return
         if data == 'panel:input:autoaccept:off':
             await self._command_autoaccept_off(update, context)
+            if query:
+                await self._show_autoaccept_menu(query)
             return
         if data == 'panel:input:help':
             await self._safe_reply(update, self._panel_input_help_text(), parse_mode=ParseMode.HTML, dismissable=True)
@@ -1292,47 +1541,53 @@ class TelegramBotService(QObject):
         # Logs
         if data == 'panel:logs:tail40':
             text = await asyncio.to_thread(self._read_log_tail, 40)
-            await self._safe_reply(update, f'🧾 <b>Логи:</b>\n<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🧾 <b>Логи:</b>\n<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
         if data == 'panel:logs:tail100':
             text = await asyncio.to_thread(self._read_log_tail, 100)
-            await self._safe_reply(update, f'🧾 <b>Логи:</b>\n<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'🧾 <b>Логи:</b>\n<pre>{html.escape(text)}</pre>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
             return
 
-        await self._safe_reply(update, '❌ Неизвестное действие панели.', dismissable=True)
+        await self._safe_reply(update, '❌ Неизвестное действие панели.', dismissable=True, as_toast=True)
 
     async def _execute_power_action(self, update: Update, action: str, delay: int) -> None:
         if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True)
+            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True,
+                                   as_toast=True)
             return
 
         try:
             if action == 'shutdown':
                 result = await asyncio.to_thread(schedule_shutdown, delay)
                 self.log_message.emit(result.message)
-                await self._safe_reply(update, f'⚡️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+                await self._safe_reply(update, f'⚡️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True, as_toast=True)
             elif action == 'reboot':
                 result = await asyncio.to_thread(schedule_reboot, delay)
                 self.log_message.emit(result.message)
-                await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+                await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True, as_toast=True)
             elif action == 'hibernate':
                 if self._hibernate_task and not self._hibernate_task.done():
                     self._hibernate_task.cancel()
                 self._hibernate_task = asyncio.create_task(self._delayed_hibernate(update, delay))
                 await self._safe_reply(update, f'⏳ <b>Гибернация запланирована через {delay} сек.</b>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
+                                       parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             else:
                 raise ValueError('Unknown power action.')
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка действия: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
 
     async def _delayed_hibernate(self, update: Update, delay: int) -> None:
         try:
             await asyncio.sleep(delay)
             result = await asyncio.to_thread(hibernate_system)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'❄️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❄️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
         except asyncio.CancelledError:
             pass
 
@@ -1346,8 +1601,7 @@ class TelegramBotService(QObject):
     @staticmethod
     def _dismiss_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton('👌', callback_data='panel:dismiss'),
-             InlineKeyboardButton('⬅️ В меню', callback_data='panel:main')]
+            [InlineKeyboardButton('👌', callback_data='panel:dismiss')]
         ])
 
     @staticmethod
@@ -1364,22 +1618,8 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('🔋 Питание', callback_data='panel:power'),
              InlineKeyboardButton('🎥 Медиа', callback_data='panel:media')],
             [InlineKeyboardButton('🧾 Логи', callback_data='panel:logs'),
-             InlineKeyboardButton('❓ Помощь', callback_data='panel:help')]
-        ])
-
-    @staticmethod
-    def _panel_overview_text() -> str:
-        return '📊 <b>Обзор системы</b>\n\nЧастые действия и статус ПК.'
-
-    @staticmethod
-    def _panel_overview_markup() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton('📈 Статус', callback_data='panel:status'),
-             InlineKeyboardButton('⏱ Аптайм', callback_data='panel:uptime')],
-            [InlineKeyboardButton('🖼 Скриншот', callback_data='panel:screenshot'),
-             InlineKeyboardButton('🟢 Ping', callback_data='panel:ping')],
-            [InlineKeyboardButton('🪪 Мой ID', callback_data='panel:myid')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
+             InlineKeyboardButton('❓ Помощь', callback_data='panel:help')],
+            [InlineKeyboardButton('🖼 Скриншот', callback_data='panel:screenshot')]
         ])
 
     @staticmethod
@@ -1392,8 +1632,9 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('📍 Текущая папка', callback_data='panel:files:pwd'),
              InlineKeyboardButton('📚 Список файлов', callback_data='panel:files:ls')],
             [InlineKeyboardButton('📤 Загрузить сюда', callback_data='panel:files:upload'),
-             InlineKeyboardButton('✋ Отмена загрузки', callback_data='panel:files:cancelupload')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
+             InlineKeyboardButton('✋ Отмена', callback_data='panel:files:cancelupload')],
+            [InlineKeyboardButton('💾 Список дисков', callback_data='panel:files:drives')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
@@ -1404,7 +1645,7 @@ class TelegramBotService(QObject):
     def _panel_process_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('📋 Список процессов', callback_data='panel:proc:list')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
@@ -1425,7 +1666,7 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('⏱ Удержание ПКМ', callback_data='panel:input:righthold')],
             [InlineKeyboardButton('🤖 Управление AutoAccept', callback_data='panel:aa:main')],
             [InlineKeyboardButton('❓ Команды ввода', callback_data='panel:input:help')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
@@ -1437,25 +1678,12 @@ class TelegramBotService(QObject):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('📸 Фото с вебки', callback_data='panel:media:webcam')],
             [InlineKeyboardButton('🎥 Видео (5с)', callback_data='panel:media:webcamvid5'),
-             InlineKeyboardButton('🎥 Видео (15с)', callback_data='panel:media:webcamvid15')],
+             InlineKeyboardButton('🎥 (15с)', callback_data='panel:media:webcamvid15'),
+             InlineKeyboardButton('🎥 (60с)', callback_data='panel:media:webcamvid60')],
             [InlineKeyboardButton('🎙 Аудио (5с)', callback_data='panel:media:audio5'),
-             InlineKeyboardButton('🎙 Аудио (15с)', callback_data='panel:media:audio15')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
-        ])
-
-    @staticmethod
-    def _panel_autoaccept_text() -> str:
-        return '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
-
-    @staticmethod
-    def _panel_autoaccept_markup() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
-            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'),
-             InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
-            [InlineKeyboardButton('▶️ Запустить бота', callback_data='panel:input:autoaccept:on')],
-            [InlineKeyboardButton('⏹ Остановить', callback_data='panel:input:autoaccept:off')],
-            [InlineKeyboardButton('⬅️ Назад к вводу', callback_data='panel:input')]
+             InlineKeyboardButton('🎙 (15с)', callback_data='panel:media:audio15'),
+             InlineKeyboardButton('🎙 (60с)', callback_data='panel:media:audio60')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
@@ -1493,7 +1721,7 @@ class TelegramBotService(QObject):
              InlineKeyboardButton('🔄 Ребут 1м', callback_data='panel:power:reboot60'),
              InlineKeyboardButton('🔄 Ребут 5м', callback_data='panel:power:reboot300')],
             [InlineKeyboardButton('✋ Отменить выключение/ребут/гибернацию', callback_data='panel:power:cancel')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
@@ -1505,7 +1733,7 @@ class TelegramBotService(QObject):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('📄 40 строк', callback_data='panel:logs:tail40'),
              InlineKeyboardButton('📄 100 строк', callback_data='panel:logs:tail100')],
-            [InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
@@ -1524,15 +1752,10 @@ class TelegramBotService(QObject):
 
     @staticmethod
     def _panel_help_markup() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ В главное меню', callback_data='panel:main')]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]])
 
     async def _require_input_commands(self, update: Update) -> bool:
-        if not await self._ensure_admin(update):
-            return False
-        if not self._config_provider().allow_input_commands:
-            await self._safe_reply(update, '❌ Управление вводом отключено в настройках.', parse_mode=ParseMode.HTML, dismissable=True)
-            return False
-        return True
+        return await self._ensure_admin(update, 'input')
 
     @staticmethod
     def _parse_combination_args(args: list[str]) -> list[str]:
@@ -1575,9 +1798,9 @@ class TelegramBotService(QObject):
         application = self._application
         if application is None:
             return
-        for admin_id in self._config_provider().admin_ids:
+        for admin_id in self._config_provider().admins.keys():
             try:
-                await application.bot.send_message(chat_id=admin_id, text=text)
+                await application.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML)
             except Exception as exc:
                 self.log_message.emit(f'Failed to notify admin {admin_id}: {exc}')
 
@@ -1585,27 +1808,17 @@ class TelegramBotService(QObject):
         await self._delete_user_message(update)
         if not await self._ensure_admin(update):
             return
-        await self._safe_reply(update, '❌ Неизвестная команда. Введите /help для просмотра всех команд.', dismissable=True)
+        await self._safe_reply(update, '❌ Неизвестная команда. Введите /help для просмотра всех команд.',
+                               dismissable=True, as_toast=True)
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         self.log_message.emit(f'Unhandled bot error: {context.error}')
         if isinstance(update, Update):
-            await self._safe_reply(update, '❌ Внутренняя ошибка бота. Проверьте логи приложения.', dismissable=True)
-
-    async def _ensure_admin(self, update: Update) -> bool:
-        user = update.effective_user
-        user_id = getattr(user, 'id', None)
-        if user_id is None:
-            return False
-
-        if user_id not in self._config_provider().admin_ids:
-            self.log_message.emit(f'Access denied for user_id={user_id}')
-            await self._safe_reply(update, '❌ Доступ запрещен. Ваш Telegram ID не найден в списке администраторов.', dismissable=True)
-            return False
-        return True
+            await self._safe_reply(update, f'❌ Внутренняя ошибка бота:\n<code>{html.escape(str(context.error))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _safe_reply(self, update: Update, text: str, reply_markup: InlineKeyboardMarkup | None = None,
-                          parse_mode: str | None = None, dismissable: bool = False) -> None:
+                          parse_mode: str | None = None, dismissable: bool = False, as_toast: bool = False) -> None:
         chat = update.effective_chat
         if chat is None:
             return
@@ -1617,18 +1830,40 @@ class TelegramBotService(QObject):
 
         clipped = text.strip()
         chunks = [clipped[i: i + 3800] for i in range(0, len(clipped), 3800)]
-        
+
+        # Определяем, содержит ли текст ошибку тайм-аута
+        is_timeout = 'timed out' in text.lower() or 'timeout' in text.lower()
+
         if query and query.message:
+            if as_toast or is_timeout:
+                try:
+                    clean_text = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>',
+                                                                                                           '').replace(
+                        '❌ ', '')
+                    # При таймауте показываем Alert (show_alert=True), для обычных toast просто всплывашку снизу
+                    await query.answer(clean_text[:200], show_alert=is_timeout)
+                except Exception:
+                    pass
+                # Строго выходим: не изменяем сообщение на текст ошибки и не шлем новое
+                return
+
             try:
-                await query.message.edit_text(chunks[0], reply_markup=reply_markup if len(chunks) == 1 else None, parse_mode=parse_mode)
+                await query.message.edit_text(chunks[0], reply_markup=reply_markup if len(chunks) == 1 else None,
+                                              parse_mode=parse_mode)
                 for chunk in chunks[1:]:
-                    await chat.send_message(chunk, reply_markup=reply_markup if chunk == chunks[-1] else None, parse_mode=parse_mode)
+                    await chat.send_message(chunk, reply_markup=reply_markup if chunk == chunks[-1] else None,
+                                            parse_mode=parse_mode)
                 return
             except Exception:
                 pass
 
+        # Если это тайм-аут, но мы дошли сюда (например, ответ не удался) — все равно прерываем
+        if is_timeout and query:
+            return
+
         for index, chunk in enumerate(chunks):
-            await chat.send_message(chunk, reply_markup=reply_markup if index == len(chunks)-1 else None, parse_mode=parse_mode)
+            await chat.send_message(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None,
+                                    parse_mode=parse_mode)
 
     async def _send_temporary_status(self, update: Update, text: str) -> object | None:
         query = update.callback_query
@@ -1707,8 +1942,11 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('download', self._command_download))
         self._application.add_handler(CommandHandler('upload', self._command_upload))
         self._application.add_handler(CommandHandler('cancelupload', self._command_cancel_upload))
+        self._application.add_handler(CommandHandler('drives', self._command_drives))
         self._application.add_handler(CommandHandler('tasklist', self._command_tasklist))
         self._application.add_handler(CommandHandler('taskkill', self._command_taskkill))
+        self._application.add_handler(MessageHandler(filters.Regex(r'^/kill_\d+'), self._command_kill_regex))
+        self._application.add_handler(MessageHandler(filters.Regex(r'^/rmaa_'), self._command_rmaa_regex))
         self._application.add_handler(CommandHandler('printtext', self._command_printtext))
         self._application.add_handler(CommandHandler('combination', self._command_combination))
         self._application.add_handler(CommandHandler('message', self._command_message))
@@ -1765,9 +2003,12 @@ class TelegramBotService(QObject):
         return root.resolve(strict=False)
 
     def _resolve_user_path(self, user_id: int, raw_path: str | None) -> Path:
+        config = self._config_provider()
+        allow_all = config.allow_all_files
         root = self._base_root()
+
         cwd = self._cwd_by_user.get(user_id, root)
-        if not self._is_allowed_path(cwd, root):
+        if not allow_all and not self._is_allowed_path(cwd, root):
             cwd = root
             self._cwd_by_user[user_id] = root
 
@@ -1779,7 +2020,7 @@ class TelegramBotService(QObject):
             target = cwd
 
         resolved = target.resolve(strict=False)
-        if not self._is_allowed_path(resolved, root):
+        if not allow_all and not self._is_allowed_path(resolved, root):
             raise ValueError(f'Path is outside allowed root: {root}')
         return resolved
 
@@ -1813,12 +2054,37 @@ class TelegramBotService(QObject):
             lines.append(f'... and {len(entries) - limit} more items.')
         return '\n'.join(lines)
 
+    def _build_aa_listing_text(self, target: Path, bot_username: str) -> str:
+        if not target.exists():
+            return 'Шаблонов нет.'
+        entries = sorted(
+            [e for e in target.iterdir() if e.is_file() and e.suffix.lower() in {'.png', '.jpg', '.jpeg', '.bmp'}])
+        if not entries:
+            return 'Шаблонов нет.'
+
+        lines = ['📂 <b>Шаблоны AutoAccept:</b>\n']
+        for entry in entries:
+            encoded = base64.urlsafe_b64encode(entry.name.encode('utf-8')).decode('utf-8').rstrip('=')
+            link_show = f'https://t.me/{bot_username}?start=aa_{encoded}'
+            link_del = f'https://t.me/{bot_username}?start=rmaa_{encoded}'
+            lines.append(f'<a href="{link_del}">❌</a> 🖼 <a href="{link_show}">{html.escape(entry.name)}</a>')
+
+        return '\n'.join(lines)
+
     def _remove_path(self, target: Path, recursive: bool) -> None:
+        config = self._config_provider()
+        allow_all = config.allow_all_files
         root = self._base_root()
+
         if not target.exists():
             raise ValueError('Path does not exist.')
-        if target.resolve(strict=False) == root:
+
+        resolved = target.resolve(strict=False)
+        if not allow_all and resolved == root:
             raise ValueError('Cannot remove allowed root directory.')
+
+        if allow_all and str(resolved.parent) == str(resolved):
+            raise ValueError('Cannot remove a drive root!')
 
         if target.is_file():
             target.unlink()
@@ -1830,7 +2096,7 @@ class TelegramBotService(QObject):
 
         target.rmdir()
 
-    def _build_tasklist_text(self, filter_text: str) -> str:
+    def _build_tasklist_text(self, filter_text: str, bot_username: str) -> str:
         records: list[tuple[int, str, float]] = []
         for process in psutil.process_iter(['pid', 'name', 'memory_info']):
             try:
@@ -1848,12 +2114,14 @@ class TelegramBotService(QObject):
             return 'No processes matched your filter.'
 
         records.sort(key=lambda row: row[2], reverse=True)
-        top = records[:60]
-        lines = ['🔝 Top processes by RAM usage:']
+        top = records[:30]  # Снизили до 30, чтобы HTML-разметка не обрезалась лимитами Телеграма
+        lines = ['🔝 <b>Топ процессов по ОЗУ:</b>\n']
         for pid, name, memory_mb in top:
-            lines.append(f'PID {pid:>6} | {memory_mb:>8.1f} MB | {name}')
+            link_kill = f'https://t.me/{bot_username}?start=kill_{pid}'
+            lines.append(
+                f'<a href="{link_kill}">❌</a> | <code>{memory_mb:>6.1f} MB</code> | <code>{html.escape(name)}</code>')
         if len(records) > len(top):
-            lines.append(f'... and {len(records) - len(top)} more.')
+            lines.append(f'\n... и ещё {len(records) - len(top)} процессов.')
         return '\n'.join(lines)
 
     @staticmethod

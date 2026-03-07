@@ -21,49 +21,72 @@ LOG_DIR = APP_DIR / 'logs'
 
 
 @dataclass(slots=True)
+class AdminPerms:
+    power: bool = True
+    open_url: bool = True
+    files: bool = True
+    process: bool = True
+    input: bool = True
+    media: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'AdminPerms':
+        return cls(
+            power=bool(data.get('power', True)),
+            open_url=bool(data.get('open_url', True)),
+            files=bool(data.get('files', True)),
+            process=bool(data.get('process', True)),
+            input=bool(data.get('input', True)),
+            media=bool(data.get('media', True)),
+        )
+
+
+@dataclass(slots=True)
 class AppConfig:
     bot_token: str = ''
-    admin_ids: list[int] = field(default_factory=list)
+    admins: dict[str, AdminPerms] = field(default_factory=dict)
     autostart: bool = False
     start_minimized: bool = True
     auto_start_bot: bool = True
-    allow_power_commands: bool = True
-    allow_open_url_command: bool = True
-    allow_file_commands: bool = True
-    allow_process_commands: bool = True
-    allow_input_commands: bool = True
+    allow_all_files: bool = False
     files_root: str = field(default_factory=lambda: str(Path.home()))
     autoaccept_templates_dir: str = field(default_factory=lambda: str(APP_DIR / 'autoaccept_templates'))
     show_notifications: bool = True
+    installed: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> 'AppConfig':
+        # Миграция старого формата (список ID) в новый (словарь с правами)
+        old_admin_ids = data.get('admin_ids', [])
+        admins_data = data.get('admins', {})
+
+        parsed_admins = {}
+        for admin_id_str, perms_dict in admins_data.items():
+            parsed_admins[str(admin_id_str)] = AdminPerms.from_dict(perms_dict)
+
+        if isinstance(old_admin_ids, list):
+            for a_id in old_admin_ids:
+                if str(a_id) not in parsed_admins:
+                    parsed_admins[str(a_id)] = AdminPerms()
+
         return cls(
             bot_token=str(data.get('bot_token', '') or '').strip(),
-            admin_ids=ConfigManager.parse_admins(data.get('admin_ids', [])),
+            admins=parsed_admins,
             autostart=bool(data.get('autostart', False)),
             start_minimized=bool(data.get('start_minimized', True)),
             auto_start_bot=bool(data.get('auto_start_bot', True)),
-            allow_power_commands=bool(data.get('allow_power_commands', True)),
-            allow_open_url_command=bool(data.get('allow_open_url_command', True)),
-            allow_file_commands=bool(data.get('allow_file_commands', True)),
-            allow_process_commands=bool(data.get('allow_process_commands', True)),
-            allow_input_commands=bool(data.get('allow_input_commands', True)),
-            files_root=str(data.get('files_root', '') or str(Path.home())).strip(),
-            autoaccept_templates_dir=str(data.get('autoaccept_templates_dir', '') or str(APP_DIR / 'autoaccept_templates')).strip(),
+            allow_all_files=bool(data.get('allow_all_files', False)),
+            files_root=str(data.get('files_root', str(Path.home()))),
+            autoaccept_templates_dir=str(
+                data.get('autoaccept_templates_dir', '') or str(APP_DIR / 'autoaccept_templates')).strip(),
             show_notifications=bool(data.get('show_notifications', True)),
+            installed=bool(data.get('installed', False)),
         )
 
     def to_dict(self) -> dict:
-        return asdict(self)
-
-    @property
-    def masked_token(self) -> str:
-        if not self.bot_token:
-            return ''
-        if len(self.bot_token) <= 10:
-            return '***'
-        return f'{self.bot_token[:6]}...{self.bot_token[-4:]}'
+        d = asdict(self)
+        d['admins'] = {k: asdict(v) for k, v in self.admins.items()}
+        return d
 
 
 class ConfigManager:
@@ -100,18 +123,10 @@ class ConfigManager:
         return self._config
 
     @staticmethod
-    def parse_admins(raw_text: str | Iterable[str | int]) -> list[int]:
-        if isinstance(raw_text, str):
-            parts = re.split(r'[\s,;]+', raw_text.strip())
-        else:
-            parts = [str(item).strip() for item in raw_text]
-
-        result: set[int] = set()
+    def parse_admins(raw_text: str, existing_admins: dict[str, AdminPerms]) -> dict[str, AdminPerms]:
+        parts = re.split(r'[\s,;]+', raw_text.strip())
+        new_admins = {}
         for part in parts:
-            if not part:
-                continue
-            value = int(part)
-            if value <= 0:
-                raise ValueError('Admin ID should be a positive integer.')
-            result.add(value)
-        return sorted(result)
+            if part.strip():
+                new_admins[part] = existing_admins.get(part, AdminPerms())
+        return new_admins

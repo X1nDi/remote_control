@@ -19,7 +19,6 @@ if pyautogui is not None:
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0.03
 
-
 AUTOACCEPT_DIR = APP_DIR / 'autoaccept_templates'
 
 
@@ -125,11 +124,11 @@ class AutoAcceptService:
         return self._active
 
     def start(
-        self,
-        config: AutoAcceptConfig,
-        on_match: Callable[[str], None],
-        on_error: Callable[[str], None],
-        on_finish: Callable[[str], None],
+            self,
+            config: AutoAcceptConfig,
+            on_match: Callable[[str], None],
+            on_error: Callable[[str], None],
+            on_finish: Callable[[str], None],
     ) -> CommandResult:
         _ensure_pyautogui()
         if self._active:
@@ -156,19 +155,28 @@ class AutoAcceptService:
         return CommandResult(True, 'Auto-accept stop requested.')
 
     def _run(
-        self,
-        config: AutoAcceptConfig,
-        on_match: Callable[[str], None],
-        on_error: Callable[[str], None],
-        on_finish: Callable[[str], None],
+            self,
+            config: AutoAcceptConfig,
+            on_match: Callable[[str], None],
+            on_error: Callable[[str], None],
+            on_finish: Callable[[str], None],
     ) -> None:
         deadline = time.monotonic() + max(1, config.timeout_seconds)
         template_dir = config.template_dir.resolve(strict=False)
-        last_error_message = ''
+
+        last_errors: dict[str, str] = {}
+
+        # Проверяем наличие OpenCV заранее, чтобы не ловить ошибки в цикле
+        try:
+            import cv2
+            has_cv2 = True
+        except ImportError:
+            has_cv2 = False
 
         try:
             while not self._stop_event.is_set():
-                template_paths = [path for path in template_dir.iterdir() if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.bmp'}]
+                template_paths = [path for path in template_dir.iterdir() if
+                                  path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.bmp'}]
                 if not template_paths:
                     time.sleep(config.interval_seconds)
                     if time.monotonic() >= deadline:
@@ -181,17 +189,30 @@ class AutoAcceptService:
                         on_finish('Auto-accept stopped by user.')
                         return
                     try:
-                        point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True)
+                        if has_cv2:
+                            # Пытаемся найти с 15% допуском (работает только с opencv-python)
+                            point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True,
+                                                                   confidence=0.85)
+                        else:
+                            # 100% точный поиск (если opencv нет)
+                            point = pyautogui.locateCenterOnScreen(str(template_path), grayscale=True)
+
                         if point is not None:
                             pyautogui.click(point.x, point.y)
                             on_match(f'Auto-accept matched template: {template_path.name}')
                             on_finish('Auto-accept completed successfully.')
                             return
                     except Exception as exc:  # noqa: BLE001
-                        error_message = f'Auto-accept template error for {template_path.name}: {exc}'
-                        if error_message != last_error_message:
-                            on_error(error_message)
-                            last_error_message = error_message
+                        # Игнорируем штатное "Не найдено на экране"
+                        if type(exc).__name__ == 'ImageNotFoundException' or 'image not found' in str(
+                                exc).lower() or not str(exc).strip():
+                            pass
+                        else:
+                            error_message = f'Auto-accept template error for {template_path.name}: {exc}'
+                            if last_errors.get(template_path.name) != error_message:
+                                on_error(error_message)
+                                last_errors[template_path.name] = error_message
+
                     time.sleep(config.interval_seconds)
 
                 if time.monotonic() >= deadline:
@@ -200,7 +221,6 @@ class AutoAcceptService:
         finally:
             self._active = False
             self._stop_event.clear()
-
 
 def _normalize_key(key: str) -> str:
     normalized = key.strip().lower().replace('+', '')
@@ -212,7 +232,6 @@ def _normalize_key(key: str) -> str:
         'del': 'delete',
     }
     return aliases.get(normalized, normalized)
-
 
 def _ensure_pyautogui() -> None:
     if pyautogui is None:
