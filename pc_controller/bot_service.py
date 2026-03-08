@@ -1825,6 +1825,16 @@ class TelegramBotService(QObject):
             # Таймер завершен! Делаем паузу на 5 секунд, чтобы сообщение повисело
             self._overlay_pause_until = time.time() + 5
             self.overlay_show_signal.emit(f"✅ <b>{title}</b> завершен!", "center", True)
+
+            # --- ВОСПРОИЗВЕДЕНИЕ ЗВУКА ---
+            try:
+                import winsound
+                # Асинхронно проигрываем системный звук "Внимание" (SystemAsterisk)
+                winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+            except Exception:
+                pass
+            # -----------------------------
+
             from .input_actions import speak_text
             await asyncio.to_thread(speak_text, f"{title} завершен")
             await asyncio.sleep(5)
