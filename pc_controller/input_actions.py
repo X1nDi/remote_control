@@ -234,7 +234,9 @@ def _normalize_key(key: str) -> str:
     return aliases.get(normalized, normalized)
 
 def press_media_key(key_code: int) -> CommandResult:
-    # Прямая системная отправка сигнала
-    ctypes.windll.user32.keybd_event(key_code, 0, 1, 0)
-    ctypes.windll.user32.keybd_event(key_code, 0, 3, 0)
+    # Получаем аппаратный скан-код (обязательно для Spotify и Яндекс.Музыки)
+    scan_code = ctypes.windll.user32.MapVirtualKeyA(key_code, 0)
+    # 1 = KEYEVENTF_EXTENDEDKEY, 2 = KEYEVENTF_KEYUP
+    ctypes.windll.user32.keybd_event(key_code, scan_code, 1, 0) # Нажатие
+    ctypes.windll.user32.keybd_event(key_code, scan_code, 1 | 2, 0) # Отпускание
     return CommandResult(True, 'Media key pressed.')

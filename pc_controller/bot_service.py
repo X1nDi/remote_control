@@ -410,24 +410,31 @@ class TelegramBotService(QObject):
 
         try:
             text, thumb_bytes = await get_now_playing()
-            if query:
-                try:
-                    await query.message.delete()
-                except:
-                    pass
-            if temp_msg:
-                await self._delete_message_safe(temp_msg)
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:media')]])
 
             if thumb_bytes:
+                # В ТГ нельзя поменять текст на фото. Поэтому старое меню удаляем и кидаем фото с кнопкой Назад.
+                if query:
+                    try:
+                        await query.message.delete()
+                    except:
+                        pass
+                if temp_msg:
+                    await self._delete_message_safe(temp_msg)
+
                 stream = BytesIO(thumb_bytes)
                 stream.name = 'cover.jpg'
                 if update.effective_chat:
                     await update.effective_chat.send_photo(photo=stream, caption=text, parse_mode=ParseMode.HTML,
-                                                           reply_markup=self._dismiss_markup())
+                                                           reply_markup=markup)
             else:
-                if update.effective_chat:
-                    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML,
-                                                             reply_markup=self._dismiss_markup())
+                # А вот если обложки нет, красиво изменяем текущее сообщение
+                if query:
+                    await self._edit_panel_message(query, text, markup)
+                elif temp_msg:
+                    await temp_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                else:
+                    await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as exc:
             if temp_msg: await self._delete_message_safe(temp_msg)
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
@@ -1431,14 +1438,16 @@ class TelegramBotService(QObject):
         try:
             if text:
                 result = await asyncio.to_thread(set_clipboard, text)
-                await self._safe_reply(update, f'📋 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True, as_toast=True)
+                await self._safe_reply(update, f'📋 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             else:
                 result = await asyncio.to_thread(get_clipboard)
                 if result.ok:
-                    await self._safe_reply(update,
-                                           f'📋 <b>Текст из буфера обмена ПК:</b>\n\n<code>{html.escape(result.message)}</code>',
-                                           parse_mode=ParseMode.HTML, dismissable=True)
+                    markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]])
+                    msg_text = f'📋 <b>Текст из буфера обмена ПК:</b>\n\n<code>{html.escape(result.message)}</code>'
+                    if update.callback_query:
+                        await self._edit_panel_message(update.callback_query, msg_text, markup)
+                    else:
+                        await self._safe_reply(update, msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
                 else:
                     await self._safe_reply(update, f'❌ {html.escape(result.message)}', dismissable=True, as_toast=True)
         except Exception as exc:
