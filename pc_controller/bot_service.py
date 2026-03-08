@@ -1042,37 +1042,11 @@ class TelegramBotService(QObject):
         if not action:
             return
 
-        if action == 'printtext':
-            if not await self._ensure_admin(update, 'input'): return
-            try:
-                result = await asyncio.to_thread(type_text, text)
-                self.log_message.emit(result.message)
-                await self._safe_reply(update, f'⌨️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True)
-            except Exception as exc:
-                await self._safe_reply(update, f'❌ Ошибка печати текста: <code>{html.escape(str(exc))}</code>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
-
-
-        elif action == 'combination':
-            if not await self._ensure_admin(update, 'input'): return
-            keys = self._parse_combination_args(text.split())
-            if not keys:
-                await self._safe_reply(update, '❌ Клавиши не распознаны.', dismissable=True)
-                return
-            try:
-                result = await asyncio.to_thread(press_combination, keys)
-                self.log_message.emit(result.message)
-                await self._safe_reply(update, f'🪟 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True)
-            except Exception as exc:
-                await self._safe_reply(update, f'❌ Ошибка нажатия комбинации: <code>{html.escape(str(exc))}</code>',
-                                       parse_mode=ParseMode.HTML, dismissable=True)
-
-        elif action in ('message', 'voice'):
+        if action in ('type', 'printtext', 'combination', 'message', 'voice'):
             if not await self._ensure_admin(update, 'input'): return
             user_id = update.effective_user.id
             msg_id = self._menu_msg_id_by_user.get(user_id)
+
             if msg_id:
                 try:
                     await context.bot.edit_message_text(
@@ -1083,8 +1057,16 @@ class TelegramBotService(QObject):
                     )
                 except Exception:
                     pass
+
             try:
-                if action == 'message':
+                if action in ('type', 'printtext'):
+                    result = await asyncio.to_thread(type_text, text)
+                elif action == 'combination':
+                    keys = self._parse_combination_args(text.split())
+                    if not keys:
+                        raise ValueError('Клавиши не распознаны.')
+                    result = await asyncio.to_thread(press_combination, keys)
+                elif action == 'message':
                     result = await asyncio.to_thread(show_message, text)
                 else:
                     result = await asyncio.to_thread(speak_text, text)
@@ -1698,14 +1680,19 @@ class TelegramBotService(QObject):
 
         # Input & Mouse
         if data == 'panel:input:custom_text':
-            self._pending_action_by_user[update.effective_user.id] = 'printtext'
-            await self._safe_reply(update, '✏️ <b>Отправь текст</b>, который нужно напечатать на ПК:',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            self._pending_action_by_user[update.effective_user.id] = 'type'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')]])
+            await self._edit_panel_message(query, '✏️ <b>Отправь текст</b>, который нужно напечатать на ПК:', markup)
             return
         if data == 'panel:input:custom_combo':
             self._pending_action_by_user[update.effective_user.id] = 'combination'
-            await self._safe_reply(update, '🔠 <b>Отправь комбинацию клавиш</b> (например: win d, ctrl c):',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')]])
+            await self._edit_panel_message(query, '🔠 <b>Отправь комбинацию клавиш</b> (например: win d, ctrl c):',
+                                           markup)
             return
         if data == 'panel:input:msg':
             self._pending_action_by_user[update.effective_user.id] = 'message'
@@ -2226,19 +2213,32 @@ class TelegramBotService(QObject):
     def _run_in_thread(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._runner())
-        except Exception as exc:
-            self.log_message.emit(f'Bot startup failed: {exc}')
-        finally:
+
+        while not self._stop_event.is_set():
+            try:
+                self._loop.run_until_complete(self._runner())
+                # Если вышли штатно по кнопке Стоп из UI — прерываем цикл
+                if self._stop_event.is_set():
+                    break
+                self.log_message.emit('🔄 Бот завис. Идет автоматический перезапуск...')
+            except Exception as exc:
+                self.log_message.emit(f'Нет сети или ошибка старта: {exc}. Повтор через 10 сек...')
+
             self._running = False
             self.state_changed.emit(False)
-            if self._loop and self._loop.is_running():
-                self._loop.stop()
-            if self._loop:
-                self._loop.close()
-            self._loop = None
-            self._thread = None
+
+            # Ждем 10 секунд до новой попытки, прерываемся если нажали кнопку Стоп
+            if self._stop_event.wait(10.0):
+                break
+
+        self._running = False
+        self.state_changed.emit(False)
+        if self._loop and self._loop.is_running():
+            self._loop.stop()
+        if self._loop:
+            self._loop.close()
+        self._loop = None
+        self._thread = None
 
     async def _runner(self) -> None:
         config = self._config_provider()
@@ -2306,22 +2306,49 @@ class TelegramBotService(QObject):
         self.state_changed.emit(True)
         self.log_message.emit('Bot started successfully.')
 
+        # Отправляем уведомление о включении ПК
+        try:
+            import socket, platform
+            hostname = socket.gethostname()
+            os_name = platform.system()
+            startup_msg = f'🚀 <b>ПК Включен!</b>\n💻 Имя: <code>{html.escape(hostname)}</code> ({html.escape(os_name)})\n🤖 Бот на связи и готов к командам.'
+            await self._notify_admins(startup_msg)
+        except Exception as notify_exc:
+            self.log_message.emit(f'Failed to send startup notification: {notify_exc}')
+
         try:
             while not self._stop_event.is_set():
-                await asyncio.sleep(0.3)
+                if self._application and self._application.updater:
+                    if not self._application.updater.running:
+                        self.log_message.emit('⚠️ Соединение с Telegram потеряно!')
+                        break
+                await asyncio.sleep(0.5)
         finally:
             self.log_message.emit('Stopping bot...')
             if self._hibernate_task and not self._hibernate_task.done():
                 self._hibernate_task.cancel()
-            if self._application and self._application.updater:
-                await self._application.updater.stop()
-            if self._application:
-                await self._application.stop()
-                await self._application.shutdown()
+
+            try:
+                if self._application and self._application.updater:
+                    await self._application.updater.stop()
+                if self._application:
+                    await self._application.stop()
+                    await self._application.shutdown()
+            except Exception as cleanup_exc:
+                self.log_message.emit(f'Cleanup warning: {cleanup_exc}')
+
             self._application = None
             await asyncio.to_thread(self._auto_accept_service.stop)
-            self._pending_upload_by_user.clear()
-            self._pending_action_by_user.clear()
+
+            # Безопасная очистка всех словарей памяти
+            if hasattr(self, '_pending_upload_by_user'): self._pending_upload_by_user.clear()
+            if hasattr(self, '_pending_action_by_user'): self._pending_action_by_user.clear()
+            if hasattr(self, '_process_filter_by_user'): self._process_filter_by_user.clear()
+            if hasattr(self, '_pending_rename_by_user'): self._pending_rename_by_user.clear()
+            if hasattr(self, '_aa_menu_messages'): self._aa_menu_messages.clear()
+            if hasattr(self, '_menu_msg_id_by_user'): self._menu_msg_id_by_user.clear()
+            if hasattr(self, '_dir_items_by_user'): self._dir_items_by_user.clear()
+
             self.log_message.emit('Bot stopped.')
 
     def _base_root(self) -> Path:

@@ -23,6 +23,11 @@ def parse_delay(raw_value: str | None, default_seconds: int = 30) -> int:
     return value
 
 
+def _ensure_windows() -> None:
+    if sys.platform != 'win32':
+        raise RuntimeError('This feature is only available on Windows.')
+
+
 def schedule_shutdown(seconds: int = 30) -> CommandResult:
     _ensure_windows()
     subprocess.run(['shutdown', '/s', '/t', str(seconds)], check=True, capture_output=True, text=True)
@@ -42,7 +47,7 @@ def schedule_reboot(seconds: int = 30) -> CommandResult:
 def cancel_scheduled_power_action() -> CommandResult:
     _ensure_windows()
     subprocess.run(['shutdown', '/a'], check=True, capture_output=True, text=True)
-    return CommandResult(True, 'Scheduled shutdown/reboot canceled.')
+    return CommandResult(True, 'Scheduled power action cancelled.')
 
 
 def lock_workstation() -> CommandResult:
@@ -83,6 +88,23 @@ def open_url(url: str) -> CommandResult:
     return CommandResult(True, f'URL opened: {cleaned}')
 
 
-def _ensure_windows() -> None:
-    if sys.platform != 'win32':
-        raise RuntimeError('This command is implemented only for Windows.')
+def run_cmd(command: str) -> CommandResult:
+    _ensure_windows()
+    try:
+        # cp866 решает проблемы с кириллицей в Windows CMD
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60, encoding='cp866')
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        res = out if out else err
+        if not res:
+            res = "Команда выполнена (нет вывода)."
+
+        # Защита от огромных логов, чтобы не крашнуть отправку в ТГ
+        if len(res) > 3500:
+            res = res[:3500] + "\n...[ВЫВОД ОБРЕЗАН]..."
+
+        return CommandResult(True, res)
+    except subprocess.TimeoutExpired:
+        return CommandResult(False, "Ошибка: Превышено время ожидания (60с).")
+    except Exception as e:
+        return CommandResult(False, f"Ошибка: {e}")
