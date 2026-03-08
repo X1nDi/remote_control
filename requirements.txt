@@ -7,3 +7,4 @@ Pillow>=12.1.1
 PyAutoGUI>=0.9.54
 PyAudio
 opencv-python
+pyperclip>=1.8.2
