@@ -63,8 +63,33 @@ from .system_metrics import (
     collect_snapshot,
     format_uptime,
     get_hardware_info,
-    get_now_playing
+    get_now_playing,
+    start_security,
+    stop_security,
+    is_security_active
 )
+
+from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QApplication
+from PySide6.QtCore import Qt
+
+class OverlayWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel("")
+        self.label.setStyleSheet("color: #00ffcc; font-size: 38px; font-weight: bold; background-color: rgba(0, 0, 0, 190); padding: 25px; border-radius: 15px; font-family: 'Segoe UI', Arial;")
+        self.label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.label)
+
+    def show_text(self, text: str):
+        self.label.setText(text)
+        self.adjustSize()
+        screen = QApplication.primaryScreen().geometry()
+        self.move(screen.width() - self.width() - 40, 40)
+        self.show()
 
 MAX_DOWNLOAD_FILE_SIZE = 45 * 1024 * 1024
 MAX_LIST_ITEMS = 120
@@ -117,10 +142,17 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 class TelegramBotService(QObject):
     log_message = Signal(str)
     state_changed = Signal(bool)
+    overlay_show_signal = Signal(str)
+    overlay_hide_signal = Signal()
 
     def __init__(self, config_provider: Callable[[], AppConfig]) -> None:
         super().__init__()
         self._config_provider = config_provider
+
+        self.overlay_show_signal.connect(self._do_show_overlay)
+        self.overlay_hide_signal.connect(self._do_hide_overlay)
+        self._overlay_widget = None
+
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._application: Application | None = None
@@ -136,6 +168,15 @@ class TelegramBotService(QObject):
         self._dir_items_by_user: dict[int, list[str]] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
+
+    def _do_show_overlay(self, text: str):
+        if not self._overlay_widget:
+            self._overlay_widget = OverlayWidget()
+        self._overlay_widget.show_text(text)
+
+    def _do_hide_overlay(self):
+        if self._overlay_widget:
+            self._overlay_widget.hide()
 
     @property
     def running(self) -> bool:
@@ -1615,7 +1656,6 @@ class TelegramBotService(QObject):
     async def _show_autoaccept_menu(self, query) -> None:
         text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
         is_active = self._auto_accept_service.active
-
         toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept',
                                           callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton(
             '▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
@@ -1624,11 +1664,113 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
             [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'),
              InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
-            [toggle_btn],
-            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
+            [toggle_btn], [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
         ])
         await self._edit_panel_message(query, text, markup)
         self._aa_menu_messages[query.message.chat_id] = query.message.message_id
+
+    # === НАЧАЛО НОВЫХ ФУНКЦИЙ ГОЛОСА, ОВЕРЛЕЯ И ОХРАНЫ ===
+    async def _start_overlay_timer(self, minutes: int, title: str = "Таймер"):
+        seconds = minutes * 60
+        while seconds > 0:
+            if not self._running: break
+            mins, secs = divmod(seconds, 60)
+            self.overlay_show_signal.emit(f"⏳ {title}:\n{mins:02d}:{secs:02d}")
+            await asyncio.sleep(1)
+            seconds -= 1
+        self.overlay_show_signal.emit(f"✅ {title} завершен!")
+        await asyncio.to_thread(speak_text, f"{title} завершен")
+        await asyncio.sleep(5)
+        self.overlay_hide_signal.emit()
+
+    def _on_security_motion(self, image_bytes: bytes):
+        loop = self._loop
+        if loop:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._notify_motion(image_bytes)))
+
+    async def _notify_motion(self, image_bytes: bytes):
+        text = "🚨 <b>ВНИМАНИЕ! ЗАМЕЧЕНО ДВИЖЕНИЕ!</b> 🚨"
+        stream = BytesIO(image_bytes)
+        stream.name = 'alarm.jpg'
+        for admin_id in self._config_provider().admins.keys():
+            try:
+                await self._application.bot.send_photo(chat_id=admin_id, photo=stream, caption=text,
+                                                       parse_mode=ParseMode.HTML)
+            except:
+                pass
+
+    async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update): return
+        msg = update.effective_message
+        if not msg.voice: return
+
+        status_msg = await self._send_temporary_status(update, "⏳ <b>Распознаю голос...</b>")
+        try:
+            file = await msg.voice.get_file()
+            ogg_path = Path("temp_voice.ogg")
+            wav_path = Path("temp_voice.wav")
+            await file.download_to_drive(ogg_path)
+
+            import soundfile as sf
+            import speech_recognition as sr
+            data, samplerate = await asyncio.to_thread(sf.read, str(ogg_path))
+            await asyncio.to_thread(sf.write, str(wav_path), data, samplerate)
+
+            r = sr.Recognizer()
+            with sr.AudioFile(str(wav_path)) as source:
+                audio = await asyncio.to_thread(r.record, source)
+            text = await asyncio.to_thread(r.recognize_google, audio, language="ru-RU")
+
+            ogg_path.unlink(missing_ok=True)
+            wav_path.unlink(missing_ok=True)
+
+            text = text.lower()
+            reply = f"🗣 <b>Голос:</b> <i>{text}</i>\n\n"
+
+            if "таймер" in text:
+                import re
+                match = re.search(r'(\d+)\s*(мин|час|сек)', text)
+                if match:
+                    val = int(match.group(1))
+                    if 'час' in match.group(2): val *= 60
+                    asyncio.create_task(self._start_overlay_timer(val, "Таймер"))
+                    reply += f"⏱ Таймер на {val} мин запущен на экране."
+                else:
+                    reply += "⚠️ Таймер запрошен, но я не понял время. Скажи например: 'Таймер 5 минут'."
+            elif "напомни" in text:
+                parts = text.split("напомни", 1)
+                reminder = parts[1].strip() if len(parts) > 1 else "Напоминание!"
+                self.overlay_show_signal.emit(f"📌 Напоминание:\n{reminder.capitalize()}")
+                reply += "📌 Напоминание выведено поверх окон."
+            elif "убери" in text or "скрой" in text or "закрой" in text:
+                self.overlay_hide_signal.emit()
+                reply += "👀 Оверлей скрыт."
+            elif "спотифай" in text or "музык" in text:
+                from .input_actions import press_media_key
+                await asyncio.to_thread(press_media_key, 0xB3)
+                reply += "🎵 Плеер переключен."
+            elif "охрана" in text or "охран" in text:
+                if "включи" in text or "вруби" in text:
+                    await asyncio.to_thread(start_security, self._on_security_motion)
+                    reply += "🚨 Охранная система включена."
+                else:
+                    await asyncio.to_thread(stop_security)
+                    reply += "🛡 Охранная система выключена."
+            elif "выключи" in text and "комп" in text:
+                await asyncio.to_thread(schedule_shutdown, 0)
+                reply += "⚡️ Выключаю ПК."
+            else:
+                reply += "🤷‍♂️ Команда не распознана. Я умею: таймеры, напоминания, музыку, охрану и выключение ПК."
+
+            await status_msg.edit_text(reply, parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
+
+        except sr.UnknownValueError:
+            await status_msg.edit_text("🤷‍♂️ <b>Речь не распознана. Повторите четче.</b>", parse_mode=ParseMode.HTML,
+                                       reply_markup=self._dismiss_markup())
+        except Exception as e:
+            await status_msg.edit_text(f"❌ <b>Ошибка голоса:</b> {e}", parse_mode=ParseMode.HTML,
+                                   reply_markup=self._dismiss_markup())
 
     async def _handle_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -1875,6 +2017,15 @@ class TelegramBotService(QObject):
             return
 
         # Media
+        if data == 'panel:media:sec_toggle':
+            if is_security_active():
+                res = await asyncio.to_thread(stop_security)
+                await query.answer(res.message, show_alert=False)
+            else:
+                res = await asyncio.to_thread(start_security, self._on_security_motion)
+                await query.answer(res.message, show_alert=False)
+            await self._edit_panel_message(query, self._panel_media_text(), self._panel_media_markup())
+            return
         if data == 'panel:media:music':
             await self._command_music(update, context)
             return
@@ -2249,6 +2400,9 @@ class TelegramBotService(QObject):
 
     @staticmethod
     def _panel_media_markup() -> InlineKeyboardMarkup:
+        sec_btn = InlineKeyboardButton('🛡 Выкл Охрану',
+                                       callback_data='panel:media:sec_toggle') if is_security_active() \
+            else InlineKeyboardButton('🚨 Вкл Охрану', callback_data='panel:media:sec_toggle')
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('🎵 Что сейчас играет?', callback_data='panel:media:music')],
             [InlineKeyboardButton('⏮', callback_data='panel:media:prev'),
@@ -2257,7 +2411,7 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('🔉 Vol -', callback_data='panel:media:voldown'),
              InlineKeyboardButton('🔇 Mute', callback_data='panel:media:mute'),
              InlineKeyboardButton('🔊 Vol +', callback_data='panel:media:volup')],
-            [InlineKeyboardButton('📸 Фото с вебки', callback_data='panel:media:webcam')],
+            [sec_btn, InlineKeyboardButton('📸 Фото с вебки', callback_data='panel:media:webcam')],
             [InlineKeyboardButton('🎥 Видео (5с)', callback_data='panel:media:webcamvid5'),
              InlineKeyboardButton('🎥 (15с)', callback_data='panel:media:webcamvid15'),
              InlineKeyboardButton('🎥 (60с)', callback_data='panel:media:webcamvid60')],
@@ -2595,6 +2749,7 @@ class TelegramBotService(QObject):
         self._application.add_handler(CallbackQueryHandler(self._handle_panel_callback, pattern=r'^panel:'))
         self._application.add_handler(
             MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO, self._handle_document_upload))
+        self._application.add_handler(MessageHandler(filters.VOICE, self._handle_voice_message))
         self._application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         self._application.add_handler(MessageHandler(filters.COMMAND, self._command_unknown))
         self._application.add_error_handler(self._error_handler)

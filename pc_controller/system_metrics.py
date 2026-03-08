@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 
 import psutil
 from PIL import ImageGrab
@@ -21,6 +22,82 @@ except ImportError:
     GlobalSystemMediaTransportControlsSessionManager = None
 
 media_lock = threading.Lock()
+
+# === ОХРАННАЯ СИСТЕМА ===
+_security_active = False
+_security_thread: threading.Thread | None = None
+
+
+def is_security_active() -> bool:
+    global _security_active
+    return _security_active
+
+
+def start_security(on_motion_callback: Callable[[bytes], None]) -> CommandResult:
+    from .system_actions import CommandResult
+    global _security_active, _security_thread
+    if _security_active: return CommandResult(False, "Охрана уже включена.")
+    _security_active = True
+
+    def _loop():
+        import cv2
+        import numpy as np
+        with media_lock:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                global _security_active
+                _security_active = False
+                return
+
+            # Прогрев камеры и подстройка яркости
+            for _ in range(15):
+                cap.read()
+                time.sleep(0.1)
+
+            ret, frame1 = cap.read()
+            ret, frame2 = cap.read()
+
+            while _security_active and ret:
+                diff = cv2.absdiff(frame1, frame2)
+                gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                blur = cv2.GaussianBlur(gray, (21, 21), 0)
+                _, thresh = cv2.threshold(blur, 25, 255, cv2.THRESH_BINARY)
+                dilated = cv2.dilate(thresh, None, iterations=3)
+                contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+                motion = False
+                for contour in contours:
+                    if cv2.contourArea(contour) > 8000:  # Чувствительность движения
+                        motion = True
+                        break
+
+                if motion:
+                    success, buffer = cv2.imencode('.jpg', frame1, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if success:
+                        on_motion_callback(buffer.tobytes())
+                    # Пауза, чтобы не заспамить телеграм 100 фотками
+                    for _ in range(50):
+                        if not _security_active: break
+                        time.sleep(0.1)
+
+                frame1 = frame2
+                ret, frame2 = cap.read()
+                time.sleep(0.05)
+
+            cap.release()
+            _security_active = False
+
+    _security_thread = threading.Thread(target=_loop, daemon=True)
+    _security_thread.start()
+    return CommandResult(True, "🚨 Режим охраны включен.")
+
+
+def stop_security():
+    from .system_actions import CommandResult
+    global _security_active
+    if not _security_active: return CommandResult(False, "Охрана не была включена.")
+    _security_active = False
+    return CommandResult(True, "🛡 Режим охраны выключен.")
 
 
 @dataclass(slots=True)
@@ -81,6 +158,9 @@ def capture_screenshot_bytes() -> tuple[bytes, str]:
 
 
 def capture_webcam_photo() -> tuple[bytes, str]:
+    if is_security_active():
+        raise RuntimeError('Камера сейчас занята Охранной Системой! Выключите её перед созданием фото.')
+
     import cv2
     with media_lock:
         cap = cv2.VideoCapture(0)
@@ -103,6 +183,9 @@ def capture_webcam_photo() -> tuple[bytes, str]:
 
 
 def capture_webcam_video(duration_seconds: int = 5) -> tuple[bytes, str]:
+    if is_security_active():
+        raise RuntimeError('Камера сейчас занята Охранной Системой! Выключите её перед записью видео.')
+
     import cv2
     with media_lock:
         cap = cv2.VideoCapture(0)
@@ -165,17 +248,15 @@ def record_audio(duration_seconds: int = 5) -> tuple[bytes, str]:
 
 def get_hardware_info() -> str:
     lines = []
-
-    # Собираем данные о самых прожорливых процессах
     procs = []
     for p in psutil.process_iter(['name', 'memory_info']):
         try:
-            p.cpu_percent(interval=None)  # Инициируем замер CPU
+            p.cpu_percent(interval=None)
             procs.append(p)
         except:
             pass
 
-    time.sleep(0.15)  # Ждем долю секунды для точности замера ЦПУ
+    time.sleep(0.15)
 
     top_cpu_name, top_cpu_val = "Нет данных", 0.0
     top_ram_name, top_ram_val = "Нет данных", 0.0
@@ -186,7 +267,6 @@ def get_hardware_info() -> str:
             if c > top_cpu_val:
                 top_cpu_val = c
                 top_cpu_name = p.info['name']
-
             m = p.info['memory_info'].rss if p.info['memory_info'] else 0
             if m > top_ram_val:
                 top_ram_val = m
@@ -194,7 +274,6 @@ def get_hardware_info() -> str:
         except:
             pass
 
-    # === CPU Info ===
     try:
         import wmi
         w = wmi.WMI()
@@ -207,7 +286,6 @@ def get_hardware_info() -> str:
         lines.append(f"🧠 <b>CPU:</b> {platform.processor()}")
         lines.append(f"📈 <b>Загрузка CPU:</b> {psutil.cpu_percent()}%")
 
-    # Температура CPU (WMI)
     try:
         import wmi
         w_wmi = wmi.WMI(namespace="root\\wmi")
@@ -218,12 +296,11 @@ def get_hardware_info() -> str:
         else:
             lines.append(f"🌡 <b>Температура CPU:</b> Данные недоступны")
     except Exception:
-        lines.append(f"🌡 <b>Температура CPU:</b> (Нужны права админа или спец. драйвер)")
+        lines.append(f"🌡 <b>Температура CPU:</b> (Нужны права админа)")
 
     lines.append(f"🔥 <b>Топ процесс CPU:</b> {top_cpu_name} ({top_cpu_val:.1f}%)")
     lines.append("")
 
-    # === GPU Info ===
     top_gpu_name = "Нет данных"
     try:
         out_apps = subprocess.check_output(
@@ -257,7 +334,7 @@ def get_hardware_info() -> str:
             if len(parts) >= 5:
                 lines.append(f"🎮 <b>GPU {i}:</b> {parts[0]}")
                 lines.append(f"🌡 <b>Температура:</b> {parts[1]} °C")
-                lines.append(f"📊 <b>Нагрузка GPU:</b> {parts[2]}")  # Убрали лишний знак %
+                lines.append(f"📊 <b>Нагрузка GPU:</b> {parts[2]}")
                 lines.append(f"💾 <b>Видеопамять:</b> {parts[3]} / {parts[4]}")
                 lines.append(f"🔥 <b>Топ процесс GPU:</b> {top_gpu_name}")
                 lines.append("")
@@ -265,7 +342,6 @@ def get_hardware_info() -> str:
         lines.append("🎮 <b>GPU:</b> Данные недоступны (NVIDIA драйвер не найден)")
         lines.append("")
 
-    # === RAM Info ===
     ram = psutil.virtual_memory()
     lines.append(f"💽 <b>ОЗУ (RAM):</b> {ram.percent}%")
     lines.append(f"├ Использовано: {ram.used // (1024 ** 3)} GB")
@@ -273,11 +349,9 @@ def get_hardware_info() -> str:
     lines.append(f"🔥 <b>Топ процесс ОЗУ:</b> {top_ram_name} ({top_ram_val / (1024 * 1024):.1f} MB)")
     lines.append("")
 
-    # === Disk Info ===
     lines.append("💾 <b>Диски системы:</b>")
     for p in psutil.disk_partitions():
-        if 'cdrom' in p.opts or p.fstype == '':
-            continue
+        if 'cdrom' in p.opts or p.fstype == '': continue
         try:
             usage = psutil.disk_usage(p.mountpoint)
             lines.append(f"💿 <b>{p.mountpoint}</b> ({p.fstype}) — {usage.percent}%")
@@ -295,8 +369,7 @@ async def get_now_playing() -> tuple[str, bytes | None]:
     try:
         manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
         session = manager.get_current_session()
-        if not session:
-            return "🔇 Сейчас ничего не играет (или плеер не передает данные).", None
+        if not session: return "🔇 Сейчас ничего не играет.", None
         info = await session.try_get_media_properties_async()
         title = info.title or "Неизвестный трек"
         artist = info.artist or "Неизвестный исполнитель"

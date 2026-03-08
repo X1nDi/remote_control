@@ -10,3 +10,6 @@ opencv-python
 pyperclip>=1.8.2
 WMI>=1.5.1
 winsdk==1.0.0b10
+SpeechRecognition
+soundfile
+numpy
