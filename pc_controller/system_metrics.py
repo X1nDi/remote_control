@@ -228,7 +228,7 @@ def get_hardware_info() -> str:
     try:
         out_apps = subprocess.check_output(
             ['nvidia-smi', '--query-compute-apps=name,used_memory', '--format=csv,noheader'],
-            encoding='utf-8', timeout=3
+            encoding='utf-8', timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
         ).strip().split('\n')
 
         max_gpu_mem = -1
@@ -250,7 +250,7 @@ def get_hardware_info() -> str:
             ['nvidia-smi', '--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total',
              '--format=csv,noheader'],
             encoding='utf-8',
-            timeout=3
+            timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
         )
         for i, gpu in enumerate(out.strip().split('\n')):
             parts = [p.strip() for p in gpu.split(',')]
