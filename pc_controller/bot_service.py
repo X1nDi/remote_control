@@ -373,13 +373,26 @@ class TelegramBotService(QObject):
     async def _command_hw(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'process'): return
-        temp_msg = await self._send_temporary_status(update, '⏳ <b>Опрашиваю датчики...</b>')
+
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text('⏳ <b>Опрашиваю датчики...</b>', parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, '⏳ <b>Опрашиваю датчики...</b>')
+
         try:
             info = await asyncio.to_thread(get_hardware_info)
-            if temp_msg:
-                await temp_msg.edit_text(info, parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton('🔄 Обновить', callback_data='panel:proc:hw:refresh')],
+                [InlineKeyboardButton('⬅️ Назад', callback_data='panel:process')]
+            ])
+            if query:
+                await query.edit_message_text(info, parse_mode=ParseMode.HTML, reply_markup=markup)
+            elif temp_msg:
+                await temp_msg.edit_text(info, parse_mode=ParseMode.HTML, reply_markup=markup)
             else:
-                await self._safe_reply(update, info, parse_mode=ParseMode.HTML, dismissable=True)
+                await self._safe_reply(update, info, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as exc:
             if temp_msg: await self._delete_message_safe(temp_msg)
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
@@ -425,14 +438,17 @@ class TelegramBotService(QObject):
         try:
             from .input_actions import press_media_key
             await asyncio.to_thread(press_media_key, key_code)
-            await self._safe_reply(update, f'🎵 <b>{toast_text}</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+            await self._safe_reply(update, f'🎵 <b>{toast_text}</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                   as_toast=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
 
     async def _command_playpause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._command_media_action(update, 0xB3, 'Play / Pause')
+
     async def _command_nexttrack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._command_media_action(update, 0xB0, 'Следующий трек')
+
     async def _command_prevtrack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._command_media_action(update, 0xB1, 'Предыдущий трек')
 
@@ -445,13 +461,16 @@ class TelegramBotService(QObject):
             from .input_actions import press_media_key
             if direction == 'up':
                 for _ in range(3): await asyncio.to_thread(press_media_key, 0xAF)
-                await self._safe_reply(update, '🔊 <b>Громкость +</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                await self._safe_reply(update, '🔊 <b>Громкость +</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                       as_toast=True)
             elif direction == 'down':
                 for _ in range(3): await asyncio.to_thread(press_media_key, 0xAE)
-                await self._safe_reply(update, '🔉 <b>Громкость -</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                await self._safe_reply(update, '🔉 <b>Громкость -</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                       as_toast=True)
             elif direction == 'mute':
                 await asyncio.to_thread(press_media_key, 0xAD)
-                await self._safe_reply(update, '🔇 <b>Звук переключен</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                await self._safe_reply(update, '🔇 <b>Звук переключен</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                       as_toast=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
 
@@ -1782,6 +1801,9 @@ class TelegramBotService(QObject):
 
         # Processes & CMD
         if data == 'panel:proc:hw':
+            await self._command_hw(update, context)
+            return
+        if data == 'panel:proc:hw:refresh':
             await self._command_hw(update, context)
             return
         if data == 'panel:proc:cmd':
