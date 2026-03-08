@@ -58,7 +58,13 @@ from .system_actions import (
     sleep_system,
     run_cmd,
 )
-from .system_metrics import capture_screenshot_bytes, collect_snapshot, format_uptime
+from .system_metrics import (
+    capture_screenshot_bytes,
+    collect_snapshot,
+    format_uptime,
+    get_hardware_info,
+    get_now_playing
+)
 
 MAX_DOWNLOAD_FILE_SIZE = 45 * 1024 * 1024
 MAX_LIST_ITEMS = 120
@@ -413,24 +419,22 @@ class TelegramBotService(QObject):
             if temp_msg: await self._delete_message_safe(temp_msg)
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
 
-    async def _command_media_action(self, update: Update, action: str, toast_text: str) -> None:
+    async def _command_media_action(self, update: Update, key_code: int, toast_text: str) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'media'): return
         try:
-            await asyncio.to_thread(press_combination, [action])
-            await self._safe_reply(update, f'🎵 <b>{toast_text}</b>', parse_mode=ParseMode.HTML, dismissable=True,
-                                   as_toast=True)
+            from .input_actions import press_media_key
+            await asyncio.to_thread(press_media_key, key_code)
+            await self._safe_reply(update, f'🎵 <b>{toast_text}</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
 
     async def _command_playpause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._command_media_action(update, 'playpause', 'Play / Pause')
-
+        await self._command_media_action(update, 0xB3, 'Play / Pause')
     async def _command_nexttrack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._command_media_action(update, 'nexttrack', 'Следующий трек')
-
+        await self._command_media_action(update, 0xB0, 'Следующий трек')
     async def _command_prevtrack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._command_media_action(update, 'prevtrack', 'Предыдущий трек')
+        await self._command_media_action(update, 0xB1, 'Предыдущий трек')
 
     async def _command_vol(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -438,18 +442,16 @@ class TelegramBotService(QObject):
         if not context.args: return
         direction = context.args[0].lower()
         try:
+            from .input_actions import press_media_key
             if direction == 'up':
-                for _ in range(5): await asyncio.to_thread(press_combination, ['volumeup'])
-                await self._safe_reply(update, '🔊 <b>Громкость +</b>', parse_mode=ParseMode.HTML, dismissable=True,
-                                       as_toast=True)
+                for _ in range(3): await asyncio.to_thread(press_media_key, 0xAF)
+                await self._safe_reply(update, '🔊 <b>Громкость +</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             elif direction == 'down':
-                for _ in range(5): await asyncio.to_thread(press_combination, ['volumedown'])
-                await self._safe_reply(update, '🔉 <b>Громкость -</b>', parse_mode=ParseMode.HTML, dismissable=True,
-                                       as_toast=True)
+                for _ in range(3): await asyncio.to_thread(press_media_key, 0xAE)
+                await self._safe_reply(update, '🔉 <b>Громкость -</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             elif direction == 'mute':
-                await asyncio.to_thread(press_combination, ['volumemute'])
-                await self._safe_reply(update, '🔇 <b>Звук переключен</b>', parse_mode=ParseMode.HTML, dismissable=True,
-                                       as_toast=True)
+                await asyncio.to_thread(press_media_key, 0xAD)
+                await self._safe_reply(update, '🔇 <b>Звук переключен</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
 
@@ -1406,7 +1408,7 @@ class TelegramBotService(QObject):
     async def _command_clip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'input'): return
-        text = ' '.join(context.args).strip()
+        text = ' '.join(context.args).strip() if context.args else ''
         try:
             if text:
                 result = await asyncio.to_thread(set_clipboard, text)
@@ -1968,11 +1970,17 @@ class TelegramBotService(QObject):
             await self._command_righthold(update, context)
             return
 
-        if data == 'panel:input:antiafk:on':
-            await self._command_antiafk_on(update, context)
-            return
-        if data == 'panel:input:antiafk:off':
-            await self._command_antiafk_off(update, context)
+        if data == 'panel:input:antiafk:toggle':
+            from .input_actions import is_anti_afk_active, start_anti_afk, stop_anti_afk
+            active = is_anti_afk_active()
+            if active:
+                await asyncio.to_thread(stop_anti_afk)
+                await query.answer("🛑 Anti-AFK выключен", show_alert=False)
+            else:
+                await asyncio.to_thread(start_anti_afk)
+                await query.answer("🎮 Anti-AFK включен", show_alert=False)
+
+            await self._edit_panel_message(query, self._panel_input_text(), self._panel_input_markup())
             return
 
         if data == 'panel:input:autoaccept:on':
@@ -2179,16 +2187,19 @@ class TelegramBotService(QObject):
     def _panel_input_text() -> str:
         return '⌨️ <b>Ввод и управление</b>\n\nЭмуляция нажатий, управление мышью, буфер обмена и макросы.'
 
-    @staticmethod
-    def _panel_input_markup() -> InlineKeyboardMarkup:
+    def _panel_input_markup(self) -> InlineKeyboardMarkup:
+        from .input_actions import is_anti_afk_active
+        is_afk = is_anti_afk_active()
+        afk_btn = InlineKeyboardButton('🛑 Выкл Anti-AFK',callback_data='panel:input:antiafk:toggle') if is_afk \
+            else InlineKeyboardButton('🎮 Вкл Anti-AFK', callback_data='panel:input:antiafk:toggle')
+
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('✏️ Свой Текст', callback_data='panel:input:custom_text'),
              InlineKeyboardButton('🔠 Свои Клавиши', callback_data='panel:input:custom_combo')],
             [InlineKeyboardButton('💬 Всплывающее Сообщение', callback_data='panel:input:msg'),
              InlineKeyboardButton('🗣 Озвучить текст', callback_data='panel:input:voice')],
             [InlineKeyboardButton('📋 Буфер обмена', callback_data='panel:input:clip')],
-            [InlineKeyboardButton('🎮 Вкл Anti-AFK', callback_data='panel:input:antiafk:on'),
-             InlineKeyboardButton('🛑 Выкл Anti-AFK', callback_data='panel:input:antiafk:off')],
+            [afk_btn],
             [InlineKeyboardButton('🖥 Свернуть окна', callback_data='panel:input:showdesk'),
              InlineKeyboardButton('🪟 Alt + Tab', callback_data='panel:input:alttab')],
             [InlineKeyboardButton('🖱 ЛКМ', callback_data='panel:input:leftclick'),

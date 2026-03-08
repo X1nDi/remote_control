@@ -285,3 +285,13 @@ def _normalize_key(key: str) -> str:
         'del': 'delete',
     }
     return aliases.get(normalized, normalized)
+
+def is_anti_afk_active() -> bool:
+    global _afk_active
+    return _afk_active
+
+def press_media_key(key_code: int) -> CommandResult:
+    # Прямая системная отправка сигнала (надежнее, чем PyAutoGUI)
+    ctypes.windll.user32.keybd_event(key_code, 0, 1, 0)
+    ctypes.windll.user32.keybd_event(key_code, 0, 3, 0)
+    return CommandResult(True, 'Media key pressed.')
