@@ -41,6 +41,10 @@ from .input_actions import (
     show_message,
     speak_text,
     type_text,
+    get_clipboard,
+    set_clipboard,
+    start_anti_afk,
+    stop_anti_afk,
 )
 from .logging_setup import LOG_FILE
 from .system_actions import (
@@ -52,6 +56,7 @@ from .system_actions import (
     schedule_reboot,
     schedule_shutdown,
     sleep_system,
+    run_cmd,
 )
 from .system_metrics import capture_screenshot_bytes, collect_snapshot, format_uptime
 
@@ -85,15 +90,18 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 🔸 /download, /upload, /cancelupload
 🔸 /drives - Список всех дисков
 
-⚙️ <b>Процессы:</b>
+⚙️ <b>Процессы и Система:</b>
 🔸 /tasklist [filter] - Список
 🔸 /kill_PID - Быстрое завершение (PID)
+🔸 /cmd &lt;команда&gt; - Выполнить в CMD
 
 ⌨️ <b>Ввод и управление:</b>
 🔸 /printtext &lt;text&gt;
 🔸 /combination &lt;keys...&gt;
 🔸 /movemouse &lt;x&gt; &lt;y&gt; [sec]
 🔸 /message, /voice
+🔸 /clip [text] - Буфер обмена
+🔸 /antiafkon, /antiafkoff - Anti-AFK
 🔸 /autoaccepton, /autoacceptoff
 
 🌐 <b>Прочее:</b>
@@ -774,11 +782,13 @@ class TelegramBotService(QObject):
         try:
             target = self._resolve_user_path(user_id, raw_path)
             bot_username = self._application.bot.username
-            text, total_pages = await asyncio.to_thread(self._build_interactive_dir_page, user_id, target, bot_username, 0)
+            text, total_pages = await asyncio.to_thread(self._build_interactive_dir_page, user_id, target, bot_username,
+                                                        0)
             markup = self._files_list_markup(0, total_pages)
             await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception as exc:
-            await self._safe_reply(update, f'❌ Ошибка /ls: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка /ls: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_cd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -929,7 +939,8 @@ class TelegramBotService(QObject):
                 parse_mode=ParseMode.HTML, reply_markup=markup
             )
         except Exception as exc:
-            await self._safe_reply(update, f'❌ Ошибка /upload: <code>{html.escape(str(exc))}</code>', parse_mode=ParseMode.HTML, dismissable=True)
+            await self._safe_reply(update, f'❌ Ошибка /upload: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
 
     async def _command_cancel_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -975,7 +986,6 @@ class TelegramBotService(QObject):
             root = self._base_root()
             aa_dir = self._autoaccept_template_dir()
 
-            # Check if target is inside autoaccept dir to bypass root restriction
             is_aa_dir = False
             try:
                 target_dir.relative_to(aa_dir)
@@ -1042,7 +1052,7 @@ class TelegramBotService(QObject):
         if not action:
             return
 
-        if action in ('type', 'printtext', 'combination', 'message', 'voice'):
+        if action in ('type', 'printtext', 'combination', 'message', 'voice', 'cmd', 'clip_set'):
             if not await self._ensure_admin(update, 'input'): return
             user_id = update.effective_user.id
             msg_id = self._menu_msg_id_by_user.get(user_id)
@@ -1068,20 +1078,32 @@ class TelegramBotService(QObject):
                     result = await asyncio.to_thread(press_combination, keys)
                 elif action == 'message':
                     result = await asyncio.to_thread(show_message, text)
-                else:
+                elif action == 'voice':
                     result = await asyncio.to_thread(speak_text, text)
-                self.log_message.emit(result.message)
+                elif action == 'clip_set':
+                    result = await asyncio.to_thread(set_clipboard, text)
+                elif action == 'cmd':
+                    result = await asyncio.to_thread(run_cmd, text)
+                    self.log_message.emit(f"CMD run: {text}")
+                    await self._safe_reply(update,
+                                           f"💻 <b>Терминал:</b> <code>{html.escape(text)}</code>\n\n<pre>{html.escape(result.message)}</pre>",
+                                           parse_mode=ParseMode.HTML, dismissable=True)
+
+                if action != 'cmd':
+                    self.log_message.emit(result.message)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
             finally:
                 if msg_id:
                     try:
+                        markup = self._panel_process_markup() if action == 'cmd' else self._panel_input_markup()
+                        text_menu = self._panel_process_text() if action == 'cmd' else self._panel_input_text()
                         await context.bot.edit_message_text(
                             chat_id=user_id,
                             message_id=msg_id,
-                            text=self._panel_input_text(),
-                            reply_markup=self._panel_input_markup(),
+                            text=text_menu,
+                            reply_markup=markup,
                             parse_mode=ParseMode.HTML
                         )
                     except Exception:
@@ -1110,7 +1132,6 @@ class TelegramBotService(QObject):
                         await self._safe_reply(update, msg_text, reply_markup=markup, parse_mode=ParseMode.HTML,
                                                dismissable=True)
                 else:
-
                     await self._safe_reply(update, msg_text, reply_markup=markup, parse_mode=ParseMode.HTML,
                                            dismissable=True)
             except Exception as exc:
@@ -1150,6 +1171,28 @@ class TelegramBotService(QObject):
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /taskkill: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'process'): return
+        command = ' '.join(context.args).strip()
+        if not command:
+            await self._safe_reply(update, 'Использование: <code>/cmd <команда></code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
+            return
+
+        temp_msg = await self._send_temporary_status(update, '⏳ <b>Выполняю команду...</b>')
+        try:
+            result = await asyncio.to_thread(run_cmd, command)
+            self.log_message.emit(f"CMD run: {command}")
+            text = f"💻 <b>Терминал:</b> <code>{html.escape(command)}</code>\n\n<pre>{html.escape(result.message)}</pre>"
+            if temp_msg:
+                await temp_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
+            else:
+                await self._safe_reply(update, text, parse_mode=ParseMode.HTML, dismissable=True)
+        except Exception as exc:
+            if temp_msg: await self._delete_message_safe(temp_msg)
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
 
     async def _command_kill_regex(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1266,6 +1309,46 @@ class TelegramBotService(QObject):
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /voice: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_clip(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'input'): return
+        text = ' '.join(context.args).strip()
+        try:
+            if text:
+                result = await asyncio.to_thread(set_clipboard, text)
+                await self._safe_reply(update, f'📋 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       dismissable=True, as_toast=True)
+            else:
+                result = await asyncio.to_thread(get_clipboard)
+                if result.ok:
+                    await self._safe_reply(update,
+                                           f'📋 <b>Текст из буфера обмена ПК:</b>\n\n<code>{html.escape(result.message)}</code>',
+                                           parse_mode=ParseMode.HTML, dismissable=True)
+                else:
+                    await self._safe_reply(update, f'❌ {html.escape(result.message)}', dismissable=True, as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+
+    async def _command_antiafk_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'input'): return
+        try:
+            result = await asyncio.to_thread(start_anti_afk)
+            await self._safe_reply(update, f'🎮 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True, as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+
+    async def _command_antiafk_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'input'): return
+        try:
+            result = await asyncio.to_thread(stop_anti_afk)
+            await self._safe_reply(update, f'🛑 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True, as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
 
     async def _command_leftclick(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1602,7 +1685,20 @@ class TelegramBotService(QObject):
                                        parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             return
 
-        # Processes
+        # Processes & CMD
+        if data == 'panel:proc:cmd':
+            self._pending_action_by_user[update.effective_user.id] = 'cmd'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отменить', callback_data='panel:proc:cancel_cmd')]])
+            await self._edit_panel_message(query,
+                                           '💻 <b>Отправьте команду</b>, которую нужно выполнить в терминале (CMD/PowerShell):',
+                                           markup)
+            return
+        if data == 'panel:proc:cancel_cmd':
+            self._pending_action_by_user.pop(update.effective_user.id, None)
+            await self._edit_panel_message(query, self._panel_process_text(), self._panel_process_markup())
+            return
+
         if data == 'panel:proc:list':
             user_id = update.effective_user.id
             self._process_filter_by_user[user_id] = ''
@@ -1711,6 +1807,20 @@ class TelegramBotService(QObject):
             await self._edit_panel_message(query, '🗣 <b>Отправьте текст</b>, который ПК должен произнести голосом:',
                                            markup)
             return
+        if data == 'panel:input:clip':
+            self._pending_action_by_user[update.effective_user.id] = 'clip_set'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton('📥 Получить текущий буфер', callback_data='panel:input:clip_get')],
+                [InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')]
+            ])
+            await self._edit_panel_message(query,
+                                           '📋 <b>Отправьте текст</b>, чтобы скопировать его в буфер обмена ПК, или нажмите кнопку ниже для получения текущего текста:',
+                                           markup)
+            return
+        if data == 'panel:input:clip_get':
+            await self._command_clip(update, context)
+            return
         if data == 'panel:input:cancel_text':
             self._pending_action_by_user.pop(update.effective_user.id, None)
             await self._edit_panel_message(query, self._panel_input_text(), self._panel_input_markup())
@@ -1738,6 +1848,14 @@ class TelegramBotService(QObject):
         if data == 'panel:input:righthold':
             await self._command_righthold(update, context)
             return
+
+        if data == 'panel:input:antiafk:on':
+            await self._command_antiafk_on(update, context)
+            return
+        if data == 'panel:input:antiafk:off':
+            await self._command_antiafk_off(update, context)
+            return
+
         if data == 'panel:input:autoaccept:on':
             try:
                 timeout = 300
@@ -1911,13 +2029,14 @@ class TelegramBotService(QObject):
 
     @staticmethod
     def _panel_process_text() -> str:
-        return '⚙️ <b>Процессы</b>\n\nСписок активных процессов. Для точечного завершения используй <code>/taskkill &lt;pid&gt;</code>.'
+        return '⚙️ <b>Система и Процессы</b>\n\nУправление процессами и доступ к системному терминалу.'
 
     @staticmethod
     def _panel_process_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('📋 Все процессы', callback_data='panel:proc:list')],
             [InlineKeyboardButton('🔎 Поиск процесса', callback_data='panel:proc:search')],
+            [InlineKeyboardButton('💻 Терминал (CMD)', callback_data='panel:proc:cmd')],
             [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
@@ -1933,12 +2052,12 @@ class TelegramBotService(QObject):
         if nav_row:
             buttons.append(nav_row)
         buttons.append([InlineKeyboardButton('🔎 Новый поиск', callback_data='panel:proc:search')])
-        buttons.append([InlineKeyboardButton('⬅️ В меню процессов', callback_data='panel:process')])
+        buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:process')])
         return InlineKeyboardMarkup(buttons)
 
     @staticmethod
     def _panel_input_text() -> str:
-        return '⌨️ <b>Ввод и мышь</b>\n\nЭмуляция нажатий, управление курсором и автоматизация.'
+        return '⌨️ <b>Ввод и управление</b>\n\nЭмуляция нажатий, управление мышью, буфер обмена и макросы.'
 
     @staticmethod
     def _panel_input_markup() -> InlineKeyboardMarkup:
@@ -1947,6 +2066,9 @@ class TelegramBotService(QObject):
              InlineKeyboardButton('🔠 Свои Клавиши', callback_data='panel:input:custom_combo')],
             [InlineKeyboardButton('💬 Всплывающее Сообщение', callback_data='panel:input:msg'),
              InlineKeyboardButton('🗣 Озвучить текст', callback_data='panel:input:voice')],
+            [InlineKeyboardButton('📋 Буфер обмена', callback_data='panel:input:clip')],
+            [InlineKeyboardButton('🎮 Вкл Anti-AFK', callback_data='panel:input:antiafk:on'),
+             InlineKeyboardButton('🛑 Выкл Anti-AFK', callback_data='panel:input:antiafk:off')],
             [InlineKeyboardButton('🖥 Свернуть окна', callback_data='panel:input:showdesk'),
              InlineKeyboardButton('🪟 Alt + Tab', callback_data='panel:input:alttab')],
             [InlineKeyboardButton('🖱 ЛКМ', callback_data='panel:input:leftclick'),
@@ -1987,6 +2109,8 @@ class TelegramBotService(QObject):
             '<code>/movemouse &lt;x&gt; &lt;y&gt; [sec]</code>\n'
             '<code>/message &lt;text&gt;</code>\n'
             '<code>/voice &lt;text&gt;</code>\n'
+            '<code>/clip [text]</code>\n'
+            '<code>/antiafkon</code> <code>/antiafkoff</code>\n'
             '<code>/autoaccepton [timeout]</code>\n'
             '<code>/autoacceptoff</code>'
         )
@@ -2032,8 +2156,8 @@ class TelegramBotService(QObject):
             '❓ <b>Помощь по панели:</b>\n'
             '• Обзор — статус, аптайм, ping, скриншот.\n'
             '• Файлы — текущая папка, список файлов, upload.\n'
-            '• Процессы — список процессов.\n'
-            '• Ввод — горячие клавиши, мышь, автоакцепт.\n'
+            '• Процессы — список процессов, терминал.\n'
+            '• Ввод — горячие клавиши, мышь, макросы.\n'
             '• Медиа — фото, видео, аудио.\n'
             '• Питание — lock, sleep, hibernate, выключение.\n'
             '• Логи — чтение файла логов.\n\n'
@@ -2076,7 +2200,6 @@ class TelegramBotService(QObject):
 
     def _handle_autoaccept_finish(self, text: str) -> None:
         self.log_message.emit(text)
-        # Отправляем в чат ТОЛЬКО если это не ручная остановка и не штатное завершение
         if "остановлен пользователем" not in text and "успешно завершен" not in text:
             self._notify_admins_from_thread(text)
 
@@ -2097,7 +2220,8 @@ class TelegramBotService(QObject):
         markup = self._dismiss_markup()
         for admin_id in self._config_provider().admins.keys():
             try:
-                await application.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await application.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML,
+                                                   reply_markup=markup)
             except Exception as exc:
                 self.log_message.emit(f'Failed to notify admin {admin_id}: {exc}')
 
@@ -2105,16 +2229,20 @@ class TelegramBotService(QObject):
         application = self._application
         if not application: return
         is_active = self._auto_accept_service.active
-        toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept', callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton('▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
+        toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept',
+                                          callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton(
+            '▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
-            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'), InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
+            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'),
+             InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
             [toggle_btn], [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
         ])
         text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
         for chat_id, msg_id in list(self._aa_menu_messages.items()):
             try:
-                await application.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode=ParseMode.HTML)
+                await application.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id,
+                                                        reply_markup=markup, parse_mode=ParseMode.HTML)
             except Exception:
                 pass
 
@@ -2146,7 +2274,6 @@ class TelegramBotService(QObject):
         clipped = text.strip()
         chunks = [clipped[i: i + 3800] for i in range(0, len(clipped), 3800)]
 
-        # Определяем, содержит ли текст ошибку тайм-аута
         is_timeout = 'timed out' in text.lower() or 'timeout' in text.lower()
 
         if query and query.message:
@@ -2158,7 +2285,6 @@ class TelegramBotService(QObject):
                     await query.answer(clean_text[:200], show_alert=is_timeout or show_alert)
                 except Exception:
                     pass
-                # Строго выходим: не изменяем сообщение на текст ошибки и не шлем новое
                 return
 
             try:
@@ -2170,10 +2296,9 @@ class TelegramBotService(QObject):
                 return
             except Exception as e:
                 if 'Message is not modified' in str(e):
-                    return  # Прерываем отправку дубля
+                    return
                 pass
 
-        # Если это тайм-аут, но мы дошли сюда (например, ответ не удался) — все равно прерываем
         if is_timeout and query:
             return
 
@@ -2217,7 +2342,6 @@ class TelegramBotService(QObject):
         while not self._stop_event.is_set():
             try:
                 self._loop.run_until_complete(self._runner())
-                # Если вышли штатно по кнопке Стоп из UI — прерываем цикл
                 if self._stop_event.is_set():
                     break
                 self.log_message.emit('🔄 Бот завис. Идет автоматический перезапуск...')
@@ -2227,7 +2351,6 @@ class TelegramBotService(QObject):
             self._running = False
             self.state_changed.emit(False)
 
-            # Ждем 10 секунд до новой попытки, прерываемся если нажали кнопку Стоп
             if self._stop_event.wait(10.0):
                 break
 
@@ -2274,6 +2397,7 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('drives', self._command_drives))
         self._application.add_handler(CommandHandler('tasklist', self._command_tasklist))
         self._application.add_handler(CommandHandler('taskkill', self._command_taskkill))
+        self._application.add_handler(CommandHandler('cmd', self._command_cmd))
         self._application.add_handler(MessageHandler(filters.Regex(r'^/kill_\d+'), self._command_kill_regex))
         self._application.add_handler(MessageHandler(filters.Regex(r'^/rmaa_'), self._command_rmaa_regex))
         self._application.add_handler(CommandHandler('printtext', self._command_printtext))
@@ -2281,6 +2405,9 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('message', self._command_message))
         self._application.add_handler(CommandHandler('voice', self._command_voice))
         self._application.add_handler(CommandHandler('say', self._command_voice))
+        self._application.add_handler(CommandHandler('clip', self._command_clip))
+        self._application.add_handler(CommandHandler('antiafkon', self._command_antiafk_on))
+        self._application.add_handler(CommandHandler('antiafkoff', self._command_antiafk_off))
         self._application.add_handler(CommandHandler('leftclick', self._command_leftclick))
         self._application.add_handler(CommandHandler('rightclick', self._command_rightclick))
         self._application.add_handler(CommandHandler('leftdoubleclick', self._command_leftdoubleclick))
@@ -2291,7 +2418,7 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('autoacceptoff', self._command_autoaccept_off))
         self._application.add_handler(CallbackQueryHandler(self._handle_panel_callback, pattern=r'^panel:'))
         self._application.add_handler(
-            MessageHandler(filters.Document.ALL | filters.PHOTO, self._handle_document_upload))
+            MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO, self._handle_document_upload))
         self._application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         self._application.add_handler(MessageHandler(filters.COMMAND, self._command_unknown))
         self._application.add_error_handler(self._error_handler)
@@ -2306,7 +2433,6 @@ class TelegramBotService(QObject):
         self.state_changed.emit(True)
         self.log_message.emit('Bot started successfully.')
 
-        # Отправляем уведомление о включении ПК
         try:
             import socket, platform
             hostname = socket.gethostname()
@@ -2340,7 +2466,6 @@ class TelegramBotService(QObject):
             self._application = None
             await asyncio.to_thread(self._auto_accept_service.stop)
 
-            # Безопасная очистка всех словарей памяти
             if hasattr(self, '_pending_upload_by_user'): self._pending_upload_by_user.clear()
             if hasattr(self, '_pending_action_by_user'): self._pending_action_by_user.clear()
             if hasattr(self, '_process_filter_by_user'): self._process_filter_by_user.clear()
