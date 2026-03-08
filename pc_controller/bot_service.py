@@ -364,6 +364,99 @@ class TelegramBotService(QObject):
         await self._safe_reply(update, '🟢 <b>Pong!</b> Связь с ПК установлена.', parse_mode=ParseMode.HTML,
                                dismissable=True)
 
+    async def _command_hw(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'process'): return
+        temp_msg = await self._send_temporary_status(update, '⏳ <b>Опрашиваю датчики...</b>')
+        try:
+            info = await asyncio.to_thread(get_hardware_info)
+            if temp_msg:
+                await temp_msg.edit_text(info, parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
+            else:
+                await self._safe_reply(update, info, parse_mode=ParseMode.HTML, dismissable=True)
+        except Exception as exc:
+            if temp_msg: await self._delete_message_safe(temp_msg)
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+
+    async def _command_music(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'media'): return
+
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text('⏳ <b>Получаю инфо о треке...</b>', parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, '⏳ <b>Получаю инфо о треке...</b>')
+
+        try:
+            text, thumb_bytes = await get_now_playing()
+            if query:
+                try:
+                    await query.message.delete()
+                except:
+                    pass
+            if temp_msg:
+                await self._delete_message_safe(temp_msg)
+
+            if thumb_bytes:
+                stream = BytesIO(thumb_bytes)
+                stream.name = 'cover.jpg'
+                if update.effective_chat:
+                    await update.effective_chat.send_photo(photo=stream, caption=text, parse_mode=ParseMode.HTML,
+                                                           reply_markup=self._dismiss_markup())
+            else:
+                if update.effective_chat:
+                    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML,
+                                                             reply_markup=self._dismiss_markup())
+        except Exception as exc:
+            if temp_msg: await self._delete_message_safe(temp_msg)
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+
+    async def _command_media_action(self, update: Update, action: str, toast_text: str) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'media'): return
+        try:
+            await asyncio.to_thread(press_combination, [action])
+            await self._safe_reply(update, f'🎵 <b>{toast_text}</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                   as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+
+    async def _command_playpause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._command_media_action(update, 'playpause', 'Play / Pause')
+
+    async def _command_nexttrack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._command_media_action(update, 'nexttrack', 'Следующий трек')
+
+    async def _command_prevtrack(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._command_media_action(update, 'prevtrack', 'Предыдущий трек')
+
+    async def _command_vol(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'media'): return
+        if not context.args: return
+        direction = context.args[0].lower()
+        try:
+            if direction == 'up':
+                for _ in range(5): await asyncio.to_thread(press_combination, ['volumeup'])
+                await self._safe_reply(update, '🔊 <b>Громкость +</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                       as_toast=True)
+            elif direction == 'down':
+                for _ in range(5): await asyncio.to_thread(press_combination, ['volumedown'])
+                await self._safe_reply(update, '🔉 <b>Громкость -</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                       as_toast=True)
+            elif direction == 'mute':
+                await asyncio.to_thread(press_combination, ['volumemute'])
+                await self._safe_reply(update, '🔇 <b>Звук переключен</b>', parse_mode=ParseMode.HTML, dismissable=True,
+                                       as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+
+    async def _command_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.args = ['mute']
+        await self._command_vol(update, context)
+
     async def _command_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update):
@@ -1686,6 +1779,9 @@ class TelegramBotService(QObject):
             return
 
         # Processes & CMD
+        if data == 'panel:proc:hw':
+            await self._command_hw(update, context)
+            return
         if data == 'panel:proc:cmd':
             self._pending_action_by_user[update.effective_user.id] = 'cmd'
             self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
@@ -1746,6 +1842,29 @@ class TelegramBotService(QObject):
             return
 
         # Media
+        if data == 'panel:media:music':
+            await self._command_music(update, context)
+            return
+        if data == 'panel:media:playpause':
+            await self._command_playpause(update, context)
+            return
+        if data == 'panel:media:next':
+            await self._command_nexttrack(update, context)
+            return
+        if data == 'panel:media:prev':
+            await self._command_prevtrack(update, context)
+            return
+        if data == 'panel:media:mute':
+            await self._command_mute(update, context)
+            return
+        if data == 'panel:media:volup':
+            cloned = self._clone_context_with_args(context, ['up'])
+            await self._command_vol(update, cloned)
+            return
+        if data == 'panel:media:voldown':
+            cloned = self._clone_context_with_args(context, ['down'])
+            await self._command_vol(update, cloned)
+            return
         if data == 'panel:media:webcam':
             await self._command_webcam(update, context)
             return
@@ -2037,6 +2156,7 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('📋 Все процессы', callback_data='panel:proc:list')],
             [InlineKeyboardButton('🔎 Поиск процесса', callback_data='panel:proc:search')],
             [InlineKeyboardButton('💻 Терминал (CMD)', callback_data='panel:proc:cmd')],
+            [InlineKeyboardButton('🌡 Датчики и Железо', callback_data='panel:proc:hw')],
             [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
@@ -2083,11 +2203,18 @@ class TelegramBotService(QObject):
 
     @staticmethod
     def _panel_media_text() -> str:
-        return '🎥 <b>Медиа</b>\n\nСнимки и видео с веб-камеры, запись звука.'
+        return '🎥 <b>Медиа</b>\n\nСнимки и видео с веб-камеры, запись звука, управление музыкой.'
 
     @staticmethod
     def _panel_media_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
+            [InlineKeyboardButton('🎵 Что сейчас играет?', callback_data='panel:media:music')],
+            [InlineKeyboardButton('⏮', callback_data='panel:media:prev'),
+             InlineKeyboardButton('⏯', callback_data='panel:media:playpause'),
+             InlineKeyboardButton('⏭', callback_data='panel:media:next')],
+            [InlineKeyboardButton('🔉 Vol -', callback_data='panel:media:voldown'),
+             InlineKeyboardButton('🔇 Mute', callback_data='panel:media:mute'),
+             InlineKeyboardButton('🔊 Vol +', callback_data='panel:media:volup')],
             [InlineKeyboardButton('📸 Фото с вебки', callback_data='panel:media:webcam')],
             [InlineKeyboardButton('🎥 Видео (5с)', callback_data='panel:media:webcamvid5'),
              InlineKeyboardButton('🎥 (15с)', callback_data='panel:media:webcamvid15'),
@@ -2398,6 +2525,13 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('tasklist', self._command_tasklist))
         self._application.add_handler(CommandHandler('taskkill', self._command_taskkill))
         self._application.add_handler(CommandHandler('cmd', self._command_cmd))
+        self._application.add_handler(CommandHandler('hw', self._command_hw))
+        self._application.add_handler(CommandHandler('music', self._command_music))
+        self._application.add_handler(CommandHandler('playpause', self._command_playpause))
+        self._application.add_handler(CommandHandler('nexttrack', self._command_nexttrack))
+        self._application.add_handler(CommandHandler('prevtrack', self._command_prevtrack))
+        self._application.add_handler(CommandHandler('vol', self._command_vol))
+        self._application.add_handler(CommandHandler('mute', self._command_mute))
         self._application.add_handler(MessageHandler(filters.Regex(r'^/kill_\d+'), self._command_kill_regex))
         self._application.add_handler(MessageHandler(filters.Regex(r'^/rmaa_'), self._command_rmaa_regex))
         self._application.add_handler(CommandHandler('printtext', self._command_printtext))

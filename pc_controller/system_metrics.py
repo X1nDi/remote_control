@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import platform
 import socket
+import subprocess
 import time
 import threading
 import urllib.request
@@ -12,6 +13,12 @@ from pathlib import Path
 
 import psutil
 from PIL import ImageGrab
+
+try:
+    from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+    from winsdk.windows.storage.streams import DataReader, Buffer
+except ImportError:
+    GlobalSystemMediaTransportControlsSessionManager = None
 
 # Блокировка для камеры и микрофона, чтобы не было конфликтов при повторных запросах
 media_lock = threading.Lock()
@@ -54,44 +61,50 @@ def collect_snapshot(admin_count: int, autostart_enabled: bool, bot_running: boo
     )
 
 
-def format_uptime(total_seconds: int) -> str:
-    days, rem = divmod(max(total_seconds, 0), 86_400)
-    hours, rem = divmod(rem, 3_600)
-    minutes, seconds = divmod(rem, 60)
-    if days:
-        return f'{days}d {hours:02d}:{minutes:02d}:{seconds:02d}'
-    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+def format_uptime(seconds: int) -> str:
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    parts = []
+    if d > 0:
+        parts.append(f'{d}d')
+    if h > 0:
+        parts.append(f'{h}h')
+    if m > 0:
+        parts.append(f'{m}m')
+    if not parts or s > 0:
+        parts.append(f'{s}s')
+    return ' '.join(parts)
 
 
 def capture_screenshot_bytes() -> tuple[bytes, str]:
-    image = ImageGrab.grab(all_screens=True)
-    now = datetime.now().strftime('%Y%m%d_%H%M%S')
-    file_name = f'screenshot_{now}.jpg'
+    img = ImageGrab.grab(all_screens=True)
     output = BytesIO()
-    image.convert('RGB').save(output, format='JPEG', quality=75, optimize=True)
-    return output.getvalue(), file_name
+    img.save(output, format='JPEG', quality=85)
+    now = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return output.getvalue(), f'screen_{now}.jpg'
 
 
 def capture_webcam_photo() -> tuple[bytes, str]:
+    import cv2
     with media_lock:
-        import cv2
-        # CAP_DSHOW часто решает проблемы с зависанием камер на Windows
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                raise RuntimeError('Камера не найдена или недоступна.')
+            raise RuntimeError('Не удалось открыть веб-камеру.')
+
         try:
-            # Пропускаем несколько кадров для автонастройки экспозиции
-            for _ in range(10):
+            # Пропускаем первые кадры для автофокуса и подстройки света
+            for _ in range(5):
                 cap.read()
+                time.sleep(0.1)
+
             ret, frame = cap.read()
             if not ret:
-                raise RuntimeError('Не удалось получить кадр с камеры.')
+                raise RuntimeError('Не удалось сделать снимок.')
 
-            success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            success, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not success:
-                raise RuntimeError('Ошибка кодирования изображения.')
+                raise RuntimeError('Не удалось закодировать изображение.')
 
             now = datetime.now().strftime('%Y%m%d_%H%M%S')
             return buffer.tobytes(), f'webcam_{now}.jpg'
@@ -99,56 +112,51 @@ def capture_webcam_photo() -> tuple[bytes, str]:
             cap.release()
 
 
-def capture_webcam_video(duration_seconds: int) -> tuple[bytes, str]:
+def capture_webcam_video(duration_seconds: int = 5) -> tuple[bytes, str]:
+    import cv2
     with media_lock:
-        import cv2
-        import tempfile
-        import os
-
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                raise RuntimeError('Камера не найдена или недоступна.')
+            raise RuntimeError('Не удалось открыть веб-камеру.')
+
+        # Настраиваем параметры видео
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = 20.0
+
+        temp_file = Path('temp_video.mp4')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(temp_file), fourcc, fps, (frame_width, frame_height))
+
         try:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            fd, path = tempfile.mkstemp(suffix='.mp4')
-            os.close(fd)
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = 20.0
-
-            out = cv2.VideoWriter(path, fourcc, fps, (width, height))
-
             start_time = time.time()
-            while time.time() - start_time < duration_seconds:
+            while int(time.time() - start_time) < duration_seconds:
                 ret, frame = cap.read()
                 if ret:
                     out.write(frame)
                 else:
                     break
-            out.release()
-
-            with open(path, 'rb') as f:
-                data = f.read()
-            os.remove(path)
-
-            now = datetime.now().strftime('%Y%m%d_%H%M%S')
-            return data, f'webcamvid_{now}.mp4'
         finally:
             cap.release()
+            out.release()
+
+        if not temp_file.exists():
+            raise RuntimeError('Ошибка сохранения видео.')
+
+        video_bytes = temp_file.read_bytes()
+        temp_file.unlink()
+
+        now = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return video_bytes, f'webcam_{now}.mp4'
 
 
-def record_audio(duration_seconds: int) -> tuple[bytes, str]:
+def record_audio(duration_seconds: int = 5) -> tuple[bytes, str]:
+    import pyaudio
+    import wave
     with media_lock:
-        import pyaudio
-        import wave
-        from io import BytesIO
-
         CHUNK = 1024
         FORMAT = pyaudio.paInt16
-        CHANNELS = 2
+        CHANNELS = 1
         RATE = 44100
 
         p = pyaudio.PyAudio()
@@ -176,6 +184,94 @@ def record_audio(duration_seconds: int) -> tuple[bytes, str]:
         return output.getvalue(), f'audio_{now}.wav'
 
 
+def get_hardware_info() -> str:
+    lines = []
+
+    # === CPU Info ===
+    try:
+        import wmi
+        w = wmi.WMI()
+        cpu = w.Win32_Processor()[0]
+        lines.append(f"🧠 <b>CPU:</b> {cpu.Name}")
+        lines.append(f"⏱ <b>Частота:</b> {cpu.CurrentClockSpeed} MHz / {cpu.MaxClockSpeed} MHz")
+        lines.append(f"📈 <b>Загрузка CPU:</b> {cpu.LoadPercentage}%")
+        lines.append(f"🧮 <b>Ядра:</b> {cpu.NumberOfCores} физических / {cpu.NumberOfLogicalProcessors} потоков")
+    except Exception:
+        lines.append(f"🧠 <b>CPU:</b> {platform.processor()}")
+        lines.append(f"📈 <b>Загрузка CPU:</b> {psutil.cpu_percent()}%")
+
+    lines.append("")
+
+    # === GPU Info (через nvidia-smi) ===
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total',
+             '--format=csv,noheader'],
+            encoding='utf-8',
+            timeout=3
+        )
+        for i, gpu in enumerate(out.strip().split('\n')):
+            parts = [p.strip() for p in gpu.split(',')]
+            if len(parts) >= 5:
+                lines.append(f"🎮 <b>GPU {i}:</b> {parts[0]}")
+                lines.append(f"🌡 <b>Температура:</b> {parts[1]} °C")
+                lines.append(f"📊 <b>Нагрузка GPU:</b> {parts[2]} %")
+                lines.append(f"💾 <b>Видеопамять:</b> {parts[3]} / {parts[4]}")
+                lines.append("")
+    except Exception:
+        lines.append("🎮 <b>GPU:</b> Данные недоступны (NVIDIA драйвер не найден)")
+        lines.append("")
+
+    # === RAM Info ===
+    ram = psutil.virtual_memory()
+    lines.append(f"💽 <b>ОЗУ (RAM):</b> {ram.percent}%")
+    lines.append(f"├ Использовано: {ram.used // (1024 ** 3)} GB")
+    lines.append(f"└ Всего: {ram.total // (1024 ** 3)} GB")
+
+    lines.append("")
+
+    # === Disk Info ===
+    disk_root = _disk_root()
+    disk = psutil.disk_usage(str(disk_root))
+    lines.append(f"💾 <b>Диск системы ({disk_root}):</b> {disk.percent}%")
+    lines.append(f"├ Занято: {disk.used // (1024 ** 3)} GB")
+    lines.append(f"└ Свободно: {disk.free // (1024 ** 3)} GB")
+
+    return '\n'.join(lines)
+
+
+async def get_now_playing() -> tuple[str, bytes | None]:
+    if GlobalSystemMediaTransportControlsSessionManager is None:
+        return "❌ Библиотека winsdk не установлена или не поддерживается на вашей ОС.", None
+
+    try:
+        manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+        session = manager.get_current_session()
+        if not session:
+            return "🔇 Сейчас ничего не играет (или плеер не передает данные).", None
+
+        info = await session.try_get_media_properties_async()
+        title = info.title or "Неизвестный трек"
+        artist = info.artist or "Неизвестный исполнитель"
+
+        text = f"🎵 <b>Сейчас играет:</b>\n👤 <b>Исполнитель:</b> <code>{artist}</code>\n🎧 <b>Трек:</b> <code>{title}</code>"
+
+        thumb_bytes = None
+        if info.thumbnail:
+            try:
+                stream = await info.thumbnail.open_read_async()
+                buffer = Buffer(stream.size)
+                await stream.read_async(buffer, buffer.capacity, 0)
+                reader = DataReader.from_buffer(buffer)
+                thumb_bytes = bytearray(reader.read_bytes(buffer.length))
+            except Exception:
+                pass
+
+        return text, thumb_bytes
+    except Exception as e:
+        return f"❌ Ошибка получения медиа: {e}", None
+
+
 def _disk_root() -> Path:
     home = Path.home()
     drive = home.drive
@@ -192,10 +288,11 @@ def _public_ip() -> str:
     except Exception:
         pass
 
-    # Если публичный не получился, отдаем локальный
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(('8.8.8.8', 80))
-            return str(sock.getsockname()[0])
-    except OSError:
-        return 'unknown'
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return 'Unknown'
