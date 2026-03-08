@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Callable
 
 import psutil
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QApplication
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -38,7 +39,6 @@ from .input_actions import (
     press_combination,
     right_click,
     right_hold,
-    show_message,
     speak_text,
     type_text,
     get_clipboard,
@@ -72,24 +72,44 @@ from .system_metrics import (
 from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QApplication
 from PySide6.QtCore import Qt
 
+
 class OverlayWidget(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.WindowTransparentForInput)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.label = QLabel("")
-        self.label.setStyleSheet("color: #00ffcc; font-size: 38px; font-weight: bold; background-color: rgba(0, 0, 0, 190); padding: 25px; border-radius: 15px; font-family: 'Segoe UI', Arial;")
+        self.label.setStyleSheet(
+            "color: #00ffcc; font-size: 38px; font-weight: bold; background-color: rgba(0, 0, 0, 210); padding: 35px; border-radius: 20px; font-family: 'Segoe UI', Arial; border: 2px solid #3b82f6;")
         self.label.setAlignment(Qt.AlignCenter)
         self.layout.addWidget(self.label)
+        self._user_hidden = False  # Флаг: скрыл ли юзер окно
 
-    def show_text(self, text: str):
-        self.label.setText(text)
+    def show_text(self, text: str, position: str = "top-right", force_show: bool = True):
+        if force_show:
+            self._user_hidden = False  # Новое сообщение принудительно открывает окно
+
+        if self._user_hidden:
+            return  # Если юзер скрыл таймер, не показываем его каждую секунду
+
+        html_text = text.replace('\n', '<br>')
+        self.label.setTextFormat(Qt.RichText)
+        self.label.setText(
+            f"{html_text}<br><br><span style='font-size: 16px; color: #94a3b8;'>(Кликни по окну, чтобы закрыть)</span>")
         self.adjustSize()
         screen = QApplication.primaryScreen().geometry()
-        self.move(screen.width() - self.width() - 40, 40)
+        if position == "center":
+            self.move(screen.width() // 2 - self.width() // 2, screen.height() // 2 - self.height() // 2)
+        else:
+            self.move(screen.width() - self.width() - 40, 40)
         self.show()
+
+    def mousePressEvent(self, event):
+        self._user_hidden = True  # Запоминаем, что юзер кликнул
+        self.hide()
+
 
 MAX_DOWNLOAD_FILE_SIZE = 45 * 1024 * 1024
 MAX_LIST_ITEMS = 120
@@ -142,7 +162,7 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 class TelegramBotService(QObject):
     log_message = Signal(str)
     state_changed = Signal(bool)
-    overlay_show_signal = Signal(str)
+    overlay_show_signal = Signal(str, str, bool) # Добавили 3 аргумент: force_show
     overlay_hide_signal = Signal()
 
     def __init__(self, config_provider: Callable[[], AppConfig]) -> None:
@@ -168,11 +188,15 @@ class TelegramBotService(QObject):
         self._dir_items_by_user: dict[int, list[str]] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
+        self._active_timers: dict[str, tuple[asyncio.Task, str]] = {}  # id -> (task, description)
+        self._timer_targets: dict[str, float] = {}  # Хранит точное время завершения таймеров
+        self._timer_counter = 0
+        self._overlay_pause_until = 0.0
 
-    def _do_show_overlay(self, text: str):
+    def _do_show_overlay(self, text: str, pos: str = "top-right", force: bool = True):
         if not self._overlay_widget:
             self._overlay_widget = OverlayWidget()
-        self._overlay_widget.show_text(text)
+        self._overlay_widget.show_text(text, pos, force)
 
     def _do_hide_overlay(self):
         if self._overlay_widget:
@@ -1214,7 +1238,7 @@ class TelegramBotService(QObject):
         if not action:
             return
 
-        if action in ('type', 'printtext', 'combination', 'message', 'voice', 'cmd', 'clip_set'):
+        if action in ('type', 'printtext', 'combination', 'message', 'voice', 'cmd', 'clip_set', 'custom_remind'):
             if not await self._ensure_admin(update, 'input'): return
             user_id = update.effective_user.id
             msg_id = self._menu_msg_id_by_user.get(user_id)
@@ -1239,7 +1263,56 @@ class TelegramBotService(QObject):
                         raise ValueError('Клавиши не распознаны.')
                     result = await asyncio.to_thread(press_combination, keys)
                 elif action == 'message':
-                    result = await asyncio.to_thread(show_message, text)
+                    self.overlay_show_signal.emit(f"📩 Сообщение:\n{text}", "center", True)
+                    from .system_actions import CommandResult
+                    result = CommandResult(True, "Сообщение выведено по центру экрана.")
+                elif action == 'custom_remind':
+                    import re
+                    from datetime import datetime, timedelta
+                    match = re.match(r'^(\d{1,2}):(\d{2})\s+(.+)$', text.strip())
+                    if not match:
+                        if msg_id:
+                            # Изменили callback_data на новую кнопку
+                            markup = InlineKeyboardMarkup(
+                                [[InlineKeyboardButton('❌ Отменить', callback_data='panel:rem:cancel_custom')]])
+                            await context.bot.edit_message_text(
+                                chat_id=user_id, message_id=msg_id,
+                                text='❌ <b>Неверный формат!</b>\nНужно: <code>HH:MM Текст</code>\n<i>Пример: 15:30 Пойти есть</i>',
+                                reply_markup=markup, parse_mode=ParseMode.HTML
+                            )
+                            msg_id = None  # Предотвращаем сброс меню в finally
+                            self._pending_action_by_user[user_id] = 'custom_remind'  # Оставляем в режиме ожидания
+                        from .system_actions import CommandResult
+                        result = CommandResult(False, "Неверный формат напоминания.")
+                    else:
+                        target_h, target_m = int(match.group(1)), int(match.group(2))
+                        remind_text = match.group(3)
+                        now = datetime.now()
+                        target_time = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+                        if target_time < now:
+                            target_time += timedelta(days=1)
+                        delay = (target_time - now).total_seconds()
+
+                        self._timer_counter = getattr(self, '_timer_counter', 0) + 1
+                        tid = f"t_{self._timer_counter}"
+                        desc = f"⏰ {target_time.strftime('%H:%M')} - {remind_text[:15]}..."
+                        task = asyncio.create_task(
+                            self._start_overlay_timer(int(delay), f"Напоминание: {remind_text}", tid))
+                        self._active_timers[tid] = (task, desc)
+                        task.add_done_callback(lambda t, timer_id=tid: self._active_timers.pop(timer_id, None))
+
+                        if msg_id:
+                            markup = InlineKeyboardMarkup(
+                                [[InlineKeyboardButton('⬅️ Назад', callback_data='panel:input:reminders')]])
+                            await context.bot.edit_message_text(
+                                chat_id=user_id, message_id=msg_id,
+                                text=f"✅ <b>Напоминание установлено на {target_time.strftime('%H:%M')}</b>\n\n<i>{html.escape(remind_text)}</i>",
+                                reply_markup=markup, parse_mode=ParseMode.HTML
+                            )
+                            msg_id = None  # Предотвращаем перерисовку старого меню
+
+                        from .system_actions import CommandResult
+                        result = CommandResult(True, f"Напоминание установлено на {target_time.strftime('%H:%M')}")
                 elif action == 'voice':
                     result = await asyncio.to_thread(speak_text, text)
                 elif action == 'clip_set':
@@ -1444,13 +1517,58 @@ class TelegramBotService(QObject):
             return
 
         try:
-            result = await asyncio.to_thread(show_message, text)
-            self.log_message.emit(result.message)
-            await self._safe_reply(update, f'💬 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+            # Выводим оверлей прямо по центру экрана
+            self.overlay_show_signal.emit(f"📩 Сообщение:\n{text}", "center", True)
+
+            success_msg = "Сообщение выведено по центру экрана."
+            self.log_message.emit(success_msg)
+            await self._safe_reply(update, f'💬 <b>{success_msg}</b>', parse_mode=ParseMode.HTML,
                                    dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /message: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_remind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._require_input_commands(update): return
+
+        if len(context.args) < 2:
+            await self._safe_reply(update,
+                                   'Использование: <code>/remind HH:MM Текст</code>\nПример: <code>/remind 15:30 Выключить духовку</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+            return
+
+        time_str = context.args[0]
+        text = ' '.join(context.args[1:])
+
+        import re
+        from datetime import datetime, timedelta
+        match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
+        if not match:
+            await self._safe_reply(update, '❌ Неверный формат времени. Используйте HH:MM (например, 15:30).',
+                                   dismissable=True)
+            return
+
+        target_h, target_m = int(match.group(1)), int(match.group(2))
+        now = datetime.now()
+        target_time = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+
+        # Если указанное время уже прошло сегодня, ставим на завтра
+        if target_time < now:
+            target_time += timedelta(days=1)
+
+        delay = (target_time - now).total_seconds()
+
+        self._timer_counter = getattr(self, '_timer_counter', 0) + 1
+        tid = f"t_{self._timer_counter}"
+        desc = f"⏰ {target_time.strftime('%H:%M')} - {text[:15]}..."
+        task = asyncio.create_task(self._start_overlay_timer(int(delay), f"Напоминание: {text}", tid))
+        self._active_timers[tid] = (task, desc)
+        task.add_done_callback(lambda t, timer_id=tid: self._active_timers.pop(timer_id, None))
+
+        await self._safe_reply(update,
+                               f'✅ Напоминание <b>"{html.escape(text)}"</b> установлено на <b>{target_time.strftime("%H:%M")}</b>.',
+                               parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
 
     async def _command_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1670,34 +1788,83 @@ class TelegramBotService(QObject):
         self._aa_menu_messages[query.message.chat_id] = query.message.message_id
 
     # === НАЧАЛО НОВЫХ ФУНКЦИЙ ГОЛОСА, ОВЕРЛЕЯ И ОХРАНЫ ===
-    async def _start_overlay_timer(self, minutes: int, title: str = "Таймер"):
-        seconds = minutes * 60
-        while seconds > 0:
-            if not self._running: break
-            mins, secs = divmod(seconds, 60)
-            self.overlay_show_signal.emit(f"⏳ {title}:\n{mins:02d}:{secs:02d}")
-            await asyncio.sleep(1)
-            seconds -= 1
-        self.overlay_show_signal.emit(f"✅ {title} завершен!")
-        await asyncio.to_thread(speak_text, f"{title} завершен")
-        await asyncio.sleep(5)
-        self.overlay_hide_signal.emit()
+    async def _start_overlay_timer(self, total_seconds: int, title: str, tid: str):
+        target_time = time.time() + total_seconds
+        self._timer_targets[tid] = target_time
+        try:
+            first_tick = True
+            while True:
+                if not self._running: break
+                now = time.time()
+                remaining = target_time - now
+                if remaining <= 0:
+                    break
+
+                # Если сейчас не показывается уведомление о завершении другого таймера
+                if getattr(self, '_overlay_pause_until', 0) < now and self._timer_targets:
+                    # Ищем таймер, у которого время завершения самое маленькое
+                    closest_tid = min(self._timer_targets.keys(), key=lambda k: self._timer_targets[k])
+
+                    # Если ЭТОТ таймер самый ближний - он обновляет экран!
+                    if closest_tid == tid:
+                        mins, secs = divmod(int(remaining), 60)
+                        hours, mins = divmod(mins, 60)
+                        time_str = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins:02d}:{secs:02d}"
+
+                        display_title = title
+                        if len(display_title) > 25:
+                            display_title = display_title[:25] + "..."
+
+                        self.overlay_show_signal.emit(f"⏳ {display_title}:<br>{time_str}", "top-right", first_tick)
+                        first_tick = False
+
+                await asyncio.sleep(1)
+
+            if not self._running: return
+
+            # Таймер завершен! Делаем паузу на 5 секунд, чтобы сообщение повисело
+            self._overlay_pause_until = time.time() + 5
+            self.overlay_show_signal.emit(f"✅ <b>{title}</b> завершен!", "center", True)
+            from .input_actions import speak_text
+            await asyncio.to_thread(speak_text, f"{title} завершен")
+            await asyncio.sleep(5)
+
+            # Если после паузы больше нет активных таймеров, прячем оверлей
+            if not self._timer_targets:
+                self.overlay_hide_signal.emit()
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._timer_targets.pop(tid, None)
 
     def _on_security_motion(self, image_bytes: bytes):
         loop = self._loop
         if loop:
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self._notify_motion(image_bytes)))
 
-    async def _notify_motion(self, image_bytes: bytes):
-        text = "🚨 <b>ВНИМАНИЕ! ЗАМЕЧЕНО ДВИЖЕНИЕ!</b> 🚨"
-        stream = BytesIO(image_bytes)
-        stream.name = 'alarm.jpg'
+    async def _notify_motion(self, video_bytes: bytes):
+        text = "🚨 <b>ВНИМАНИЕ! ЗАМЕЧЕНО ДВИЖЕНИЕ!</b> 🚨\n<i>Запись 3с до и 5с после. Охрана автоматически выключена.</i>"
+        stream = BytesIO(video_bytes)
+        stream.name = 'alert.mp4'
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton('👌 Закрыть', callback_data='panel:dismiss')]])
+
         for admin_id in self._config_provider().admins.keys():
             try:
-                await self._application.bot.send_photo(chat_id=admin_id, photo=stream, caption=text,
-                                                       parse_mode=ParseMode.HTML)
-            except:
-                pass
+                stream.seek(0)
+                await self._application.bot.send_video(chat_id=admin_id, video=stream, caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+                # Обновляем меню (если оно открыто), чтобы сбросить кнопку Охраны
+                msg_id = self._menu_msg_id_by_user.get(int(admin_id))
+                if msg_id:
+                    try:
+                        await self._application.bot.edit_message_text(
+                            chat_id=admin_id, message_id=msg_id,
+                            text=self._panel_media_text(), reply_markup=self._panel_media_markup(),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except: pass
+            except: pass
 
     async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1734,14 +1901,20 @@ class TelegramBotService(QObject):
                 if match:
                     val = int(match.group(1))
                     if 'час' in match.group(2): val *= 60
-                    asyncio.create_task(self._start_overlay_timer(val, "Таймер"))
+
+                    self._timer_counter = getattr(self, '_timer_counter', 0) + 1
+                    tid = f"t_{self._timer_counter}"
+                    task = asyncio.create_task(self._start_overlay_timer(val * 60, "Таймер", tid))
+                    self._active_timers[tid] = (task, f"⏳ Таймер {val} мин")
+                    task.add_done_callback(lambda t, timer_id=tid: self._active_timers.pop(timer_id, None))
+
                     reply += f"⏱ Таймер на {val} мин запущен на экране."
                 else:
                     reply += "⚠️ Таймер запрошен, но я не понял время. Скажи например: 'Таймер 5 минут'."
             elif "напомни" in text:
                 parts = text.split("напомни", 1)
                 reminder = parts[1].strip() if len(parts) > 1 else "Напоминание!"
-                self.overlay_show_signal.emit(f"📌 Напоминание:\n{reminder.capitalize()}")
+                self.overlay_show_signal.emit(f"📌 Напоминание:<br>{reminder.capitalize()}", "center")
                 reply += "📌 Напоминание выведено поверх окон."
             elif "убери" in text or "скрой" in text or "закрой" in text:
                 self.overlay_hide_signal.emit()
@@ -2248,6 +2421,81 @@ class TelegramBotService(QObject):
                                    dismissable=True)
             return
 
+        # Reminders & Timers
+        if data == 'panel:input:reminders':
+            await self._edit_panel_message(query, self._panel_reminders_text(), self._panel_reminders_markup())
+            return
+
+        if data == 'panel:rem:manage':
+            buttons = []
+            for tid, (task, desc) in self._active_timers.items():
+                buttons.append([InlineKeyboardButton(f'❌ {desc}', callback_data=f'panel:rem:cancel:{tid}')])
+            buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:input:reminders')])
+            text = "📋 <b>Активные таймеры и напоминания:</b>\nНажмите на любой для отмены." if self._active_timers else "🤷‍♂️ <b>Нет активных таймеров.</b>"
+            await self._edit_panel_message(query, text, InlineKeyboardMarkup(buttons))
+            return
+
+        if data.startswith('panel:rem:cancel:'):
+            tid = data.split(':')[-1]
+            if tid in self._active_timers:
+                task, desc = self._active_timers.pop(tid)
+                task.cancel()
+                self.overlay_hide_signal.emit()  # Сразу прячем зависший оверлей!
+                await query.answer(f"Отменено: {desc}", show_alert=False)
+            else:
+                await query.answer("Уже завершен или не найден", show_alert=False)
+
+            # Обновляем меню после удаления
+            buttons = []
+            for t_id, (t_task, t_desc) in self._active_timers.items():
+                buttons.append([InlineKeyboardButton(f'❌ {t_desc}', callback_data=f'panel:rem:cancel:{t_id}')])
+            buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:input:reminders')])
+            text = "📋 <b>Активные таймеры и напоминания:</b>\nНажмите на любой для отмены." if self._active_timers else "🤷‍♂️ <b>Нет активных таймеров.</b>"
+            await self._edit_panel_message(query, text, InlineKeyboardMarkup(buttons))
+            return
+
+        if data == 'panel:rem:hide':
+            # Убиваем таймеры
+            for task, desc in list(self._active_timers.values()):
+                task.cancel()
+            self._active_timers.clear()
+            self._timer_targets.clear()  # <- Добавляем очистку таргетов
+            # Прячем окно
+            self.overlay_hide_signal.emit()
+            await query.answer("Оверлей скрыт, все таймеры отменены", show_alert=False)
+            return
+
+        if data == 'panel:rem:custom':
+            self._pending_action_by_user[update.effective_user.id] = 'custom_remind'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton('❌ Отменить', callback_data='panel:rem:cancel_custom')]])  # Новая кнопка
+            await self._edit_panel_message(query,
+                                           '⏰ <b>Отправьте время и текст напоминания</b>\nФормат: <code>HH:MM Текст</code>\n<i>Пример: 15:30 Позвонить маме</i>',
+                                           markup)
+            return
+
+            # Специальный обработчик отмены, который возвращает в меню Таймеров
+        if data == 'panel:rem:cancel_custom':
+            self._pending_action_by_user.pop(update.effective_user.id, None)
+            await self._edit_panel_message(query, self._panel_reminders_text(), self._panel_reminders_markup())
+            return
+
+        if data.startswith('panel:rem:'):
+            val = data.split(':')[-1]
+            try:
+                minutes = int(val)
+                self._timer_counter = getattr(self, '_timer_counter', 0) + 1
+                tid = f"t_{self._timer_counter}"
+                task = asyncio.create_task(self._start_overlay_timer(minutes * 60, "Таймер", tid))
+                desc = f"⏳ Таймер {minutes} мин"
+                self._active_timers[tid] = (task, desc)
+                task.add_done_callback(lambda t, timer_id=tid: self._active_timers.pop(timer_id, None))
+                await query.answer(f"Таймер на {minutes} мин запущен", show_alert=False)
+            except ValueError:
+                pass
+            return
+
         await self._safe_reply(update, '❌ Неизвестное действие панели.', dismissable=True, as_toast=True)
 
     async def _execute_power_action(self, update: Update, action: str, delay: int) -> None:
@@ -2369,6 +2617,24 @@ class TelegramBotService(QObject):
     def _panel_input_text() -> str:
         return '⌨️ <b>Ввод и управление</b>\n\nЭмуляция нажатий, управление мышью, буфер обмена и макросы.'
 
+    @staticmethod
+    def _panel_reminders_text() -> str:
+        return '⏱ <b>Таймеры и Напоминания</b>\nВыберите готовый таймер или установите точное время.'
+
+    @staticmethod
+    def _panel_reminders_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('⏲ 1 мин', callback_data='panel:rem:1'),
+             InlineKeyboardButton('⏲ 5 мин', callback_data='panel:rem:5'),
+             InlineKeyboardButton('⏲ 15 мин', callback_data='panel:rem:15')],
+            [InlineKeyboardButton('⏲ 30 мин', callback_data='panel:rem:30'),
+             InlineKeyboardButton('⏲ 1 час', callback_data='panel:rem:60')],
+            [InlineKeyboardButton('⏰ Точное напоминание', callback_data='panel:rem:custom')],
+            [InlineKeyboardButton('📋 Управление активными', callback_data='panel:rem:manage')],
+            [InlineKeyboardButton('❌ Отменить всё', callback_data='panel:rem:hide')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
+        ])
+
     def _panel_input_markup(self) -> InlineKeyboardMarkup:
         from .input_actions import is_anti_afk_active
         is_afk = is_anti_afk_active()
@@ -2380,6 +2646,7 @@ class TelegramBotService(QObject):
              InlineKeyboardButton('🔠 Свои Клавиши', callback_data='panel:input:custom_combo')],
             [InlineKeyboardButton('💬 Всплывающее Сообщение', callback_data='panel:input:msg'),
              InlineKeyboardButton('🗣 Озвучить текст', callback_data='panel:input:voice')],
+            [InlineKeyboardButton('⏲ Таймеры и Напоминания', callback_data='panel:input:reminders')],
             [InlineKeyboardButton('📋 Буфер обмена', callback_data='panel:input:clip')],
             [afk_btn],
             [InlineKeyboardButton('🖥 Свернуть окна', callback_data='panel:input:showdesk'),
@@ -2431,6 +2698,7 @@ class TelegramBotService(QObject):
             '<code>/righthold [sec]</code>\n'
             '<code>/movemouse &lt;x&gt; &lt;y&gt; [sec]</code>\n'
             '<code>/message &lt;text&gt;</code>\n'
+            '<code>/remind HH:MM &lt;text&gt;</code>\n'
             '<code>/voice &lt;text&gt;</code>\n'
             '<code>/clip [text]</code>\n'
             '<code>/antiafkon</code> <code>/antiafkoff</code>\n'
@@ -2733,6 +3001,7 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('printtext', self._command_printtext))
         self._application.add_handler(CommandHandler('combination', self._command_combination))
         self._application.add_handler(CommandHandler('message', self._command_message))
+        self._application.add_handler(CommandHandler('remind', self._command_remind))
         self._application.add_handler(CommandHandler('voice', self._command_voice))
         self._application.add_handler(CommandHandler('say', self._command_voice))
         self._application.add_handler(CommandHandler('clip', self._command_clip))

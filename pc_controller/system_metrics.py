@@ -23,7 +23,11 @@ except ImportError:
 
 media_lock = threading.Lock()
 
-# === ОХРАННАЯ СИСТЕМА ===
+import os
+import tempfile
+from collections import deque
+
+# === ОХРАННАЯ СИСТЕМА (VIDEO BUFFER) ===
 _security_active = False
 _security_thread: threading.Thread | None = None
 
@@ -33,31 +37,42 @@ def is_security_active() -> bool:
     return _security_active
 
 
-def start_security(on_motion_callback: Callable[[bytes], None]) -> CommandResult:
+def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
     from .system_actions import CommandResult
     global _security_active, _security_thread
     if _security_active: return CommandResult(False, "Охрана уже включена.")
     _security_active = True
 
     def _loop():
+        global _security_active
+
         import cv2
         import numpy as np
         with media_lock:
-            cap = cv2.VideoCapture(0)
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             if not cap.isOpened():
-                global _security_active
+                cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
                 _security_active = False
                 return
 
-            # Прогрев камеры и подстройка яркости
-            for _ in range(15):
-                cap.read()
-                time.sleep(0.1)
+            fps = 15.0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            # Буфер для 3 секунд "ДО" момента (fps * 3)
+            frame_buffer = deque(maxlen=int(fps * 3))
+
+            # Прогрев и адаптация к свету
+            for _ in range(10): cap.read()
 
             ret, frame1 = cap.read()
             ret, frame2 = cap.read()
+            motion_detected = False
 
-            while _security_active and ret:
+            while _security_active and not motion_detected:
+                frame_buffer.append(frame1.copy())
+
                 diff = cv2.absdiff(frame1, frame2)
                 gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
                 blur = cv2.GaussianBlur(gray, (21, 21), 0)
@@ -65,39 +80,57 @@ def start_security(on_motion_callback: Callable[[bytes], None]) -> CommandResult
                 dilated = cv2.dilate(thresh, None, iterations=3)
                 contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-                motion = False
                 for contour in contours:
-                    if cv2.contourArea(contour) > 8000:  # Чувствительность движения
-                        motion = True
+                    if cv2.contourArea(contour) > 8000:
+                        motion_detected = True
                         break
-
-                if motion:
-                    success, buffer = cv2.imencode('.jpg', frame1, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                    if success:
-                        on_motion_callback(buffer.tobytes())
-                    # Пауза, чтобы не заспамить телеграм 100 фотками
-                    for _ in range(50):
-                        if not _security_active: break
-                        time.sleep(0.1)
 
                 frame1 = frame2
                 ret, frame2 = cap.read()
-                time.sleep(0.05)
+                if not ret: break
+                time.sleep(0.04)
+
+            if motion_detected and _security_active:
+                # Записываем 5 секунд "ПОСЛЕ" момента
+                post_frames = []
+                for _ in range(int(fps * 5)):
+                    ret, f = cap.read()
+                    if not ret: break
+                    post_frames.append(f)
+                    time.sleep(0.04)
+
+                # Сборка итогового видео
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+                    tmp_path = tmp.name
+
+                out = cv2.VideoWriter(tmp_path, fourcc, fps, (width, height))
+                for f in frame_buffer: out.write(f)
+                for f in post_frames: out.write(f)
+                out.release()
+
+                with open(tmp_path, 'rb') as f:
+                    on_motion_callback(f.read())
+
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
 
             cap.release()
             _security_active = False
 
     _security_thread = threading.Thread(target=_loop, daemon=True)
     _security_thread.start()
-    return CommandResult(True, "🚨 Режим охраны включен.")
+    return CommandResult(True, "🚨 Охрана включена (Запись видео 3с до + 5с после).")
 
 
-def stop_security():
+def stop_security() -> object:
     from .system_actions import CommandResult
     global _security_active
-    if not _security_active: return CommandResult(False, "Охрана не была включена.")
+    if not _security_active: return CommandResult(False, "Охрана не активна.")
     _security_active = False
-    return CommandResult(True, "🛡 Режим охраны выключен.")
+    return CommandResult(True, "🛡 Охрана выключена.")
 
 
 @dataclass(slots=True)

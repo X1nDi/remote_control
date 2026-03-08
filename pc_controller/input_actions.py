@@ -82,18 +82,6 @@ def move_mouse(x: int, y: int, duration_seconds: float = 0.15, relative: bool = 
         pyautogui.moveTo(x=x, y=y, duration=max(0.0, min(duration_seconds, 5.0)))
         return CommandResult(True, f'Mouse moved to ({x}, {y}).')
 
-def show_message(text: str) -> CommandResult:
-    import tkinter as tk
-    from tkinter import messagebox
-    def _show():
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        messagebox.showinfo("Сообщение от ПК Контроллера", text, master=root)
-        root.destroy()
-    threading.Thread(target=_show, daemon=True).start()
-    return CommandResult(True, "Сообщение отправлено на экран.")
-
 def speak_text(text: str) -> CommandResult:
     try:
         import pyttsx3
