@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from io import BytesIO
@@ -15,8 +17,9 @@ from typing import Callable
 import psutil
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QApplication
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -185,6 +188,9 @@ class TelegramBotService(QObject):
         self._pending_rename_by_user: dict[int, Path] = {}
         self._aa_menu_messages: dict[int, int] = {}
         self._menu_msg_id_by_user: dict[int, int] = {}
+        self._media_menu_msg_id_by_user: dict[int, int] = {}
+        self._live_stream_stop_events: dict[int, asyncio.Event] = {}
+        self._live_stream_tasks: dict[int, asyncio.Task] = {}
         self._dir_items_by_user: dict[int, list[str]] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
@@ -192,6 +198,9 @@ class TelegramBotService(QObject):
         self._timer_targets: dict[str, float] = {}  # Хранит точное время завершения таймеров
         self._timer_counter = 0
         self._overlay_pause_until = 0.0
+        self._resume_notification_pending = False
+        self._startup_state_path = Path(tempfile.gettempdir()) / 'pc_controller_startup_state.json'
+        self._last_notified_boot_time = self._load_last_notified_boot_time()
 
     def _do_show_overlay(self, text: str, pos: str = "top-right", force: bool = True):
         if not self._overlay_widget:
@@ -201,6 +210,30 @@ class TelegramBotService(QObject):
     def _do_hide_overlay(self):
         if self._overlay_widget:
             self._overlay_widget.hide()
+
+    def _load_last_notified_boot_time(self) -> float | None:
+        try:
+            if not self._startup_state_path.exists():
+                return None
+            payload = json.loads(self._startup_state_path.read_text(encoding='utf-8'))
+            value = payload.get('boot_time')
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    def _save_last_notified_boot_time(self, boot_time: float) -> None:
+        try:
+            payload = {'boot_time': float(boot_time), 'saved_at': time.time()}
+            self._startup_state_path.write_text(json.dumps(payload), encoding='utf-8')
+            self._last_notified_boot_time = float(boot_time)
+        except Exception as exc:
+            self.log_message.emit(f'Failed to persist startup state: {exc}')
+
+    def _should_send_boot_notification(self, boot_time: float) -> bool:
+        last_boot_time = self._last_notified_boot_time
+        if last_boot_time is None:
+            return True
+        return abs(last_boot_time - boot_time) > 1.0
 
     @property
     def running(self) -> bool:
@@ -760,16 +793,15 @@ class TelegramBotService(QObject):
             elif temp_msg:
                 await temp_msg.edit_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
 
-            stream = BytesIO(audio_bytes)
-            stream.name = file_name
             if update.effective_chat:
-                await update.effective_chat.send_voice(
-                    voice=stream,
+                await self._send_voice_note(
+                    chat=update.effective_chat,
+                    audio_bytes=audio_bytes,
+                    file_name=file_name,
                     caption=f'🎙 <b>Аудиозапись ({duration}с)</b>',
-                    parse_mode=ParseMode.HTML,
                     reply_markup=self._dismiss_markup(),
                     read_timeout=120,
-                    write_timeout=120
+                    write_timeout=120,
                 )
             self.log_message.emit(f'Audio sent to admin {update.effective_user.id}.')
         except Exception as exc:
@@ -778,8 +810,7 @@ class TelegramBotService(QObject):
                                    parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
         finally:
             if query:
-                await query.edit_message_text(self._panel_media_text(), reply_markup=self._panel_media_markup(),
-                                              parse_mode=ParseMode.HTML)
+                await self._restore_media_menu(update)
             elif temp_msg:
                 await self._delete_message_safe(temp_msg)
 
@@ -787,73 +818,116 @@ class TelegramBotService(QObject):
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'media'): return
 
-        duration = 15
-        if context.args:
-            try:
-                duration = max(5, min(60, int(context.args[0])))
-            except ValueError:
-                pass
+        user_id = update.effective_user.id
+        active_task = self._live_stream_tasks.get(user_id)
+        if active_task and not active_task.done():
+            await self._safe_reply(
+                update,
+                'ℹ️ <b>LIVE-стрим уже запущен.</b>\nИспользуйте /stopstream или кнопку «Завершить».',
+                parse_mode=ParseMode.HTML,
+                dismissable=True,
+                as_toast=bool(update.callback_query),
+            )
+            return
 
+        task = asyncio.create_task(self._run_live_stream_session(update))
+        self._live_stream_tasks[user_id] = task
+
+        def _cleanup_live_stream(done_task: asyncio.Task, target_user_id: int = user_id) -> None:
+            if self._live_stream_tasks.get(target_user_id) is done_task:
+                self._live_stream_tasks.pop(target_user_id, None)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.log_message.emit(f'LIVE stream task failed for {target_user_id}: {exc}')
+
+        task.add_done_callback(_cleanup_live_stream)
+
+    async def _run_live_stream_session(self, update: Update) -> None:
         query = update.callback_query
         temp_msg = None
         if query:
-            await query.edit_message_text(f'📡 <b>Запуск LIVE-трансляции ({duration}с)...</b>',
-                                          parse_mode=ParseMode.HTML)
+            await query.edit_message_text('📡 <b>Запуск LIVE-трансляции...</b>', parse_mode=ParseMode.HTML)
         else:
-            temp_msg = await self._send_temporary_status(update, f"📡 <b>Запуск LIVE-трансляции ({duration}с)...</b>")
+            temp_msg = await self._send_temporary_status(update, '📡 <b>Запуск LIVE-трансляции...</b>')
 
-        end_time = time.time() + duration
+        user_id = update.effective_user.id
+        previous_stop_event = self._live_stream_stop_events.get(user_id)
+        if previous_stop_event:
+            previous_stop_event.set()
+
+        stop_event = asyncio.Event()
+        self._live_stream_stop_events[user_id] = stop_event
         first_frame = True
         last_msg = None
 
         try:
-            from telegram import InputMediaPhoto
-            while time.time() < end_time and self._running:
+            while self._running and not stop_event.is_set():
                 screenshot_bytes, file_name = await asyncio.to_thread(capture_screenshot_bytes)
                 current_time = time.strftime('%H:%M:%S')
                 caption_text = f"🔴 <b>LIVE: Трансляция экрана</b>\n<i>Обновлено: {current_time}</i>"
 
-                # КРИТИЧЕСКИ ВАЖНО: Оборачиваем в BytesIO и даем имя файлу, иначе Телеграм не обновит фото!
-                stream = BytesIO(screenshot_bytes)
-                stream.name = file_name
-
                 if first_frame:
-                    if query:
+                    if query and query.message:
+                        self._clear_media_menu_tracking(update.effective_user.id, query.message.message_id)
                         await query.message.delete()
                     elif temp_msg:
                         await self._delete_message_safe(temp_msg)
 
                     if update.effective_chat:
-                        last_msg = await update.effective_chat.send_photo(
-                            photo=stream,
-                            caption=caption_text,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=self._dismiss_markup()
+                        last_msg = await self._send_live_stream_frame(
+                            update.effective_chat,
+                            screenshot_bytes=screenshot_bytes,
+                            file_name=file_name,
+                            caption_text=caption_text,
                         )
                     first_frame = False
                 else:
-                    media = InputMediaPhoto(media=stream, caption=caption_text, parse_mode=ParseMode.HTML)
-                    try:
-                        await last_msg.edit_media(media=media, reply_markup=self._dismiss_markup())
-                    except Exception as e:
-                        if "Message is not modified" not in str(e):
-                            self.log_message.emit(f"Ошибка кадра трансляции: {e}")  # Теперь мы увидим ошибку в логах
+                    if update.effective_chat:
+                        replacement_msg = await self._send_live_stream_frame(
+                            update.effective_chat,
+                            screenshot_bytes=screenshot_bytes,
+                            file_name=file_name,
+                            caption_text=caption_text,
+                        )
+                        await self._delete_message_safe(last_msg)
+                        last_msg = replacement_msg
 
                 await asyncio.sleep(2.0)
 
         except Exception as exc:
             await self._safe_reply(update, f"❌ Ошибка трансляции: {exc}", dismissable=True)
         finally:
+            tracked_stop_event = self._live_stream_stop_events.get(user_id)
+            if tracked_stop_event is stop_event:
+                self._live_stream_stop_events.pop(user_id, None)
             try:
                 if last_msg and not first_frame:
-                    await last_msg.edit_caption(caption="⏹ <b>LIVE-Трансляция завершена.</b>",
-                                                parse_mode=ParseMode.HTML)
+                    await last_msg.edit_caption(
+                        caption="⏹ <b>LIVE-Трансляция завершена.</b>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._dismiss_markup(),
+                    )
             except:
                 pass
 
             if query:
-                await self._safe_reply(update, self._panel_media_text(), reply_markup=self._panel_media_markup(),
-                                       parse_mode=ParseMode.HTML)
+                await self._restore_media_menu(update)
+
+    async def _command_stopstream(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'media'):
+            return
+
+        user_id = getattr(update.effective_user, 'id', None)
+        if self._request_live_stream_stop(user_id):
+            await self._safe_reply(update, '⏹ <b>LIVE-стрим останавливается...</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
+        else:
+            await self._safe_reply(update, 'ℹ️ <b>Активного LIVE-стрима нет.</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
 
     async def _command_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -893,35 +967,51 @@ class TelegramBotService(QObject):
                 # Отправка экрана
                 s_stream = BytesIO(screen_bytes)
                 s_stream.name = screen_name
-                await update.effective_chat.send_photo(photo=s_stream, caption="🖼 <b>Экран</b>",
-                                                       parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_photo(
+                    photo=s_stream,
+                    caption="🖼 <b>Экран</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._dismiss_markup(),
+                )
 
                 # Отправка вебки
                 if webcam_bytes:
                     w_stream = BytesIO(webcam_bytes)
                     w_stream.name = webcam_name
-                    await update.effective_chat.send_photo(photo=w_stream, caption="📸 <b>Веб-камера</b>",
-                                                           parse_mode=ParseMode.HTML)
+                    await update.effective_chat.send_photo(
+                        photo=w_stream,
+                        caption="📸 <b>Веб-камера</b>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._dismiss_markup(),
+                    )
                 else:
                     await update.effective_chat.send_message(
-                        f"❌ <b>Веб-камера:</b> Недоступна\n<i>Причина: {webcam_err}</i>", parse_mode=ParseMode.HTML)
+                        f"❌ <b>Веб-камера:</b> Недоступна\n<i>Причина: {html.escape(webcam_err or 'unknown')}</i>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._dismiss_markup(),
+                    )
 
                 # Отправка микрофона
                 if audio_bytes:
-                    a_stream = BytesIO(audio_bytes)
-                    a_stream.name = audio_name
-                    await update.effective_chat.send_voice(voice=a_stream, caption="🎙 <b>Окружение (5с)</b>",
-                                                           parse_mode=ParseMode.HTML)
+                    await self._send_voice_note(
+                        chat=update.effective_chat,
+                        audio_bytes=audio_bytes,
+                        file_name=audio_name,
+                        caption="🎙 <b>Окружение (5с)</b>",
+                        reply_markup=self._dismiss_markup(),
+                    )
                 else:
                     await update.effective_chat.send_message(
-                        f"❌ <b>Микрофон:</b> Недоступен\n<i>Причина: {audio_err}</i>", parse_mode=ParseMode.HTML)
+                        f"❌ <b>Микрофон:</b> Недоступен\n<i>Причина: {html.escape(audio_err or 'unknown')}</i>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._dismiss_markup(),
+                    )
 
         except Exception as exc:
             await self._safe_reply(update, f"❌ Ошибка отчета: {exc}", dismissable=True)
         finally:
             if query:
-                await query.edit_message_text(self._panel_media_text(), reply_markup=self._panel_media_markup(),
-                                              parse_mode=ParseMode.HTML)
+                await self._restore_media_menu(update)
             elif temp_msg:
                 await self._delete_message_safe(temp_msg)
 
@@ -1995,36 +2085,44 @@ class TelegramBotService(QObject):
 
     async def _notify_motion(self, video_bytes: bytes, audio_bytes: bytes | None = None):
         text = "🚨 <b>ВНИМАНИЕ! ЗАМЕЧЕНО ДВИЖЕНИЕ!</b> 🚨\n<i>Запись 3с до и 5с после. Охрана автоматически выключена.</i>"
-        stream = BytesIO(video_bytes)
-        stream.name = 'alert.mp4'
         markup = InlineKeyboardMarkup([[InlineKeyboardButton('👌 Закрыть', callback_data='panel:dismiss')]])
 
         for admin_id in self._config_provider().admins.keys():
             try:
-                stream.seek(0)
-                await self._application.bot.send_video(chat_id=admin_id, video=stream, caption=text,
-                                                       parse_mode=ParseMode.HTML, reply_markup=markup)
+                async def _send_motion_video():
+                    stream = BytesIO(video_bytes)
+                    stream.name = 'alert.mp4'
+                    return await self._application.bot.send_video(
+                        chat_id=admin_id,
+                        video=stream,
+                        caption=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=markup,
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=60,
+                    )
 
-                # Отправляем аудио с места событий
+                await self._run_telegram_call_with_retry(
+                    f'motion video notify for admin {admin_id}',
+                    _send_motion_video,
+                    attempts=4,
+                    base_delay=5.0,
+                )
                 if audio_bytes:
-                    a_stream = BytesIO(audio_bytes)
-                    a_stream.name = 'alert_audio.wav'
-                    await self._application.bot.send_voice(chat_id=admin_id, voice=a_stream,
-                                                           caption="🎙 <b>Звук с места событий (8 сек)</b>",
-                                                           parse_mode=ParseMode.HTML)
-
-                msg_id = self._menu_msg_id_by_user.get(int(admin_id))
-                if msg_id:
-                    try:
-                        await self._application.bot.edit_message_text(
-                            chat_id=admin_id, message_id=msg_id,
-                            text=self._panel_media_text(), reply_markup=self._panel_media_markup(),
-                            parse_mode=ParseMode.HTML
-                        )
-                    except:
-                        pass
-            except:
-                pass
+                    await self._send_voice_note(
+                        bot=self._application.bot,
+                        chat_id=int(admin_id),
+                        audio_bytes=audio_bytes,
+                        file_name='alert_audio.wav',
+                        caption="🎙 <b>Звук с места событий (8 сек)</b>",
+                        reply_markup=self._dismiss_markup(),
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
+            except Exception as exc:
+                self.log_message.emit(f'Failed to notify admin {admin_id} about motion: {exc}')
+        await self._refresh_media_menus()
 
     async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -2034,13 +2132,19 @@ class TelegramBotService(QObject):
 
         status_msg = await self._send_temporary_status(update, "⏳ <b>Распознаю голос...</b>")
         try:
+            import speech_recognition as sr
+        except Exception as exc:
+            await status_msg.edit_text(f"❌ <b>Ошибка голоса:</b> {exc}", parse_mode=ParseMode.HTML,
+                                       reply_markup=self._dismiss_markup())
+            return
+
+        ogg_path = Path("temp_voice.ogg")
+        wav_path = Path("temp_voice.wav")
+        try:
             file = await msg.voice.get_file()
-            ogg_path = Path("temp_voice.ogg")
-            wav_path = Path("temp_voice.wav")
             await file.download_to_drive(ogg_path)
 
             import soundfile as sf
-            import speech_recognition as sr
             data, samplerate = await asyncio.to_thread(sf.read, str(ogg_path))
             await asyncio.to_thread(sf.write, str(wav_path), data, samplerate)
 
@@ -2048,9 +2152,6 @@ class TelegramBotService(QObject):
             with sr.AudioFile(str(wav_path)) as source:
                 audio = await asyncio.to_thread(r.record, source)
             text = await asyncio.to_thread(r.recognize_google, audio, language="ru-RU")
-
-            ogg_path.unlink(missing_ok=True)
-            wav_path.unlink(missing_ok=True)
 
             text = text.lower()
             # Заменяем статус-сообщение на распознанный текст (чтобы ты видел, что он услышал)
@@ -2081,8 +2182,10 @@ class TelegramBotService(QObject):
                 await self._safe_reply(update, "👀 Оверлей скрыт.", dismissable=True)
             elif "скриншот" in text or "снимок экрана" in text:
                 await self._command_screenshot(update, context)
-            elif "отчет" in text or "шпион" in text:
+            elif "отчет" in text or "шпион" in text or "отчёт" in text:
                 await self._command_report(update, context)
+            elif ("стоп" in text or "останови" in text or "заверши" in text) and "стрим" in text:
+                await self._command_stopstream(update, context)
             elif "стрим" in text or "трансляция" in text:
                 await self._command_stream(update, context)
             elif "вебк" in text or "камер" in text or "фотк" in text:
@@ -2155,13 +2258,14 @@ class TelegramBotService(QObject):
                     await self._command_playpause(update, context)
             elif "охрана" in text or "охран" in text:
                 if "включи" in text or "вруби" in text or "активир" in text:
-                    from .system_metrics import start_security, is_security_active
-                    await asyncio.to_thread(start_security, self._on_security_motion)
-                    await self._safe_reply(update, "🚨 Охранная система включена.", dismissable=True)
+                    from .system_metrics import start_security
+                    result = await asyncio.to_thread(start_security, self._on_security_motion)
+                    await self._safe_reply(update, html.escape(result.message), dismissable=True)
                 else:
                     from .system_metrics import stop_security
-                    await asyncio.to_thread(stop_security)
-                    await self._safe_reply(update, "🛡 Охранная система выключена.", dismissable=True)
+                    result = await asyncio.to_thread(stop_security)
+                    await self._safe_reply(update, html.escape(result.message), dismissable=True)
+                await self._refresh_media_menus()
             else:
                 await self._safe_reply(update,
                                        "🤷‍♂️ <b>Команда не распознана.</b>\nПопробуй: <i>напечатай привет, нажми альт таб, автопринятие, гибернация, стрим...</i>",
@@ -2172,7 +2276,10 @@ class TelegramBotService(QObject):
                                        reply_markup=self._dismiss_markup())
         except Exception as e:
             await status_msg.edit_text(f"❌ <b>Ошибка голоса:</b> {e}", parse_mode=ParseMode.HTML,
-                                   reply_markup=self._dismiss_markup())
+                                    reply_markup=self._dismiss_markup())
+        finally:
+            ogg_path.unlink(missing_ok=True)
+            wav_path.unlink(missing_ok=True)
 
     async def _handle_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -2183,6 +2290,33 @@ class TelegramBotService(QObject):
             return
 
         data = str(query.data or '')
+        user_id = getattr(update.effective_user, 'id', None)
+
+        keep_media_tracking = data in {
+            'panel:media',
+            'panel:media:stream',
+            'panel:media:report',
+            'panel:media:sec_toggle',
+            'panel:media:playpause',
+            'panel:media:next',
+            'panel:media:prev',
+            'panel:media:mute',
+            'panel:media:volup',
+            'panel:media:voldown',
+            'panel:media:webcam',
+            'panel:media:webcamvid5',
+            'panel:media:webcamvid15',
+            'panel:media:webcamvid60',
+            'panel:media:audio5',
+            'panel:media:audio15',
+            'panel:media:audio60',
+        }
+        if query.message and user_id is not None:
+            tracked_media_msg_id = self._media_menu_msg_id_by_user.get(user_id)
+            if data == 'panel:dismiss':
+                self._clear_media_menu_tracking(user_id, query.message.message_id)
+            elif tracked_media_msg_id == query.message.message_id and not keep_media_tracking:
+                self._clear_media_menu_tracking(user_id, query.message.message_id)
 
         if data.startswith('panel:files') and not await self._ensure_admin(update, 'files'): return
         if data.startswith('panel:proc') and not await self._ensure_admin(update, 'process'): return
@@ -2219,7 +2353,7 @@ class TelegramBotService(QObject):
             await self._edit_panel_message(query, self._panel_power_text(), self._panel_power_markup())
             return
         if data == 'panel:media':
-            await self._edit_panel_message(query, self._panel_media_text(), self._panel_media_markup())
+            await self._restore_media_menu(update)
             return
         if data == 'panel:logs':
             await self._edit_panel_message(query, self._panel_logs_text(), self._panel_logs_markup())
@@ -2423,6 +2557,12 @@ class TelegramBotService(QObject):
             cloned = self._clone_context_with_args(context, ['15'])
             await self._command_stream(update, cloned)
             return
+        if data == 'panel:media:stream_stop':
+            if self._request_live_stream_stop(update.effective_user.id):
+                await query.answer('Останавливаю LIVE-стрим...', show_alert=False)
+            else:
+                await query.answer('LIVE-стрим уже завершен.', show_alert=False)
+            return
         if data == 'panel:media:report':
             await self._command_report(update, context)
             return
@@ -2433,7 +2573,8 @@ class TelegramBotService(QObject):
             else:
                 res = await asyncio.to_thread(start_security, self._on_security_motion)
                 await query.answer(res.message, show_alert=False)
-            await self._edit_panel_message(query, self._panel_media_text(), self._panel_media_markup())
+            await self._restore_media_menu(update)
+            await self._refresh_media_menus()
             return
         if data == 'panel:media:music':
             await self._command_music(update, context)
@@ -2782,10 +2923,244 @@ class TelegramBotService(QObject):
             if query.message:
                 await query.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
+    def _track_media_menu_message(self, user_id: int | None, message_id: int | None) -> None:
+        if user_id is None or message_id is None:
+            return
+        self._media_menu_msg_id_by_user[user_id] = message_id
+
+    def _clear_media_menu_tracking(self, user_id: int | None, message_id: int | None = None) -> None:
+        if user_id is None:
+            return
+        tracked_message_id = self._media_menu_msg_id_by_user.get(user_id)
+        if tracked_message_id is None:
+            return
+        if message_id is None or tracked_message_id == message_id:
+            self._media_menu_msg_id_by_user.pop(user_id, None)
+
+    async def _restore_media_menu(self, update: Update) -> None:
+        user_id = getattr(update.effective_user, 'id', None)
+        text = self._panel_media_text()
+        markup = self._panel_media_markup()
+        query = update.callback_query
+
+        if query and query.message:
+            try:
+                message = await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                if hasattr(message, 'message_id'):
+                    self._track_media_menu_message(user_id, message.message_id)
+                else:
+                    self._track_media_menu_message(user_id, query.message.message_id)
+                return
+            except Exception as exc:
+                if 'Message is not modified' in str(exc):
+                    self._track_media_menu_message(user_id, query.message.message_id)
+                    return
+
+        if update.effective_chat:
+            message = await update.effective_chat.send_message(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            self._track_media_menu_message(user_id, getattr(message, 'message_id', None))
+
+    async def _refresh_media_menus(self, user_ids: list[int] | None = None) -> None:
+        if not self._application:
+            return
+
+        target_user_ids = user_ids or list(self._media_menu_msg_id_by_user.keys())
+        text = self._panel_media_text()
+        markup = self._panel_media_markup()
+
+        for user_id in list(target_user_ids):
+            msg_id = self._media_menu_msg_id_by_user.get(user_id)
+            if not msg_id:
+                continue
+            try:
+                await self._application.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=msg_id,
+                    text=text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                if 'Message is not modified' in str(exc):
+                    continue
+                self._media_menu_msg_id_by_user.pop(user_id, None)
+
+    @staticmethod
+    def _is_retryable_telegram_error(exc: Exception) -> bool:
+        if isinstance(exc, (TimedOut, NetworkError, RetryAfter)):
+            return True
+        text = str(exc).lower()
+        return 'timed out' in text or 'timeout' in text
+
+    async def _run_telegram_call_with_retry(
+        self,
+        operation_name: str,
+        operation,
+        *,
+        attempts: int = 3,
+        base_delay: float = 3.0,
+    ):
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_error = exc
+                if attempt >= attempts or not self._is_retryable_telegram_error(exc):
+                    raise
+                retry_after = getattr(exc, 'retry_after', None)
+                delay = float(retry_after) if retry_after else base_delay * attempt
+                self.log_message.emit(
+                    f'{operation_name} failed on attempt {attempt}/{attempts}: {exc}. Retry in {delay:.1f}s.'
+                )
+                await asyncio.sleep(delay)
+        if last_error is not None:
+            raise last_error
+
+    async def _send_live_stream_frame(
+        self,
+        chat,
+        *,
+        screenshot_bytes: bytes,
+        file_name: str,
+        caption_text: str,
+    ):
+        async def _send():
+            return await chat.send_photo(
+                photo=InputFile(BytesIO(screenshot_bytes), filename=file_name),
+                caption=caption_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._stream_control_markup(),
+                disable_notification=True,
+                read_timeout=180,
+                write_timeout=180,
+                connect_timeout=60,
+            )
+
+        return await self._run_telegram_call_with_retry(
+            'live stream frame send',
+            _send,
+            attempts=3,
+            base_delay=2.0,
+        )
+
+    def _request_live_stream_stop(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        stop_event = self._live_stream_stop_events.get(user_id)
+        if stop_event is not None and not stop_event.is_set():
+            stop_event.set()
+            return True
+
+        task = self._live_stream_tasks.get(user_id)
+        if task is not None and not task.done():
+            task.cancel()
+            return True
+
+        return False
+
+    @staticmethod
+    def _build_voice_note(audio_bytes: bytes, file_name: str) -> BytesIO:
+        import soundfile as sf
+
+        source_stream = BytesIO(audio_bytes)
+        source_stream.seek(0)
+        data, sample_rate = sf.read(source_stream)
+
+        output = BytesIO()
+        last_error: Exception | None = None
+        for subtype in ('OPUS', 'VORBIS'):
+            try:
+                output.seek(0)
+                output.truncate(0)
+                sf.write(output, data, sample_rate, format='OGG', subtype=subtype)
+                output.seek(0)
+                output.name = f'{Path(file_name).stem}.ogg'
+                return output
+            except Exception as exc:
+                last_error = exc
+
+        raise RuntimeError(f'Voice conversion failed: {last_error}')
+
+    async def _send_voice_note(
+        self,
+        *,
+        audio_bytes: bytes,
+        file_name: str,
+        caption: str,
+        chat=None,
+        bot=None,
+        chat_id: int | str | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        read_timeout: int = 300,
+        write_timeout: int = 300,
+    ) -> None:
+        try:
+            voice_stream = await asyncio.to_thread(self._build_voice_note, audio_bytes, file_name)
+            voice_bytes = voice_stream.getvalue()
+            voice_name = getattr(voice_stream, 'name', f'{Path(file_name).stem}.ogg')
+        except Exception as exc:
+            self.log_message.emit(f'Voice note conversion failed for {file_name}: {exc}')
+            voice_bytes = audio_bytes
+            voice_name = file_name
+
+        def _build_payload() -> BytesIO:
+            payload = BytesIO(voice_bytes)
+            payload.name = voice_name
+            return payload
+
+        if chat is not None:
+            async def _send_to_chat():
+                return await chat.send_voice(
+                    voice=_build_payload(),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                    read_timeout=read_timeout,
+                    write_timeout=write_timeout,
+                    connect_timeout=60,
+                )
+
+            await self._run_telegram_call_with_retry(
+                f'voice note send to chat {getattr(chat, "id", "unknown")}',
+                _send_to_chat,
+                attempts=4,
+                base_delay=4.0,
+            )
+            return
+
+        if bot is None or chat_id is None:
+            raise RuntimeError('Voice target is not specified.')
+
+        async def _send_to_bot():
+            return await bot.send_voice(
+                chat_id=chat_id,
+                voice=_build_payload(),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                read_timeout=read_timeout,
+                write_timeout=write_timeout,
+                connect_timeout=60,
+            )
+
+        await self._run_telegram_call_with_retry(
+            f'voice note send to chat {chat_id}',
+            _send_to_bot,
+            attempts=4,
+            base_delay=4.0,
+        )
+
     @staticmethod
     def _dismiss_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('👌', callback_data='panel:dismiss')]
+        ])
+
+    @staticmethod
+    def _stream_control_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('⏹ Завершить', callback_data='panel:media:stream_stop')]
         ])
 
     @staticmethod
@@ -3204,6 +3579,7 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('uptime', self._command_uptime))
         self._application.add_handler(CommandHandler('screenshot', self._command_screenshot))
         self._application.add_handler(CommandHandler('stream', self._command_stream))
+        self._application.add_handler(CommandHandler('stopstream', self._command_stopstream))
         self._application.add_handler(CommandHandler('report', self._command_report))
         self._application.add_handler(CommandHandler('webcam', self._command_webcam))
         self._application.add_handler(CommandHandler('webcamvid', self._command_webcamvid))
@@ -3277,8 +3653,24 @@ class TelegramBotService(QObject):
             import socket, platform
             hostname = socket.gethostname()
             os_name = platform.system()
-            startup_msg = f'🚀 <b>ПК Включен!</b>\n💻 Имя: <code>{html.escape(hostname)}</code> ({html.escape(os_name)})\n🤖 Бот на связи и готов к командам.'
-            await self._notify_admins(startup_msg)
+            boot_time = float(psutil.boot_time())
+            if self._resume_notification_pending:
+                resume_msg = (
+                    f'🌙 <b>ПК вышел из сна/гибернации!</b>\n'
+                    f'💻 Имя: <code>{html.escape(hostname)}</code> ({html.escape(os_name)})\n'
+                    f'🤖 Бот снова на связи.'
+                )
+                await self._notify_admins(resume_msg)
+                self._resume_notification_pending = False
+                self._save_last_notified_boot_time(boot_time)
+            elif self._should_send_boot_notification(boot_time):
+                startup_msg = (
+                    f'🚀 <b>ПК Включен!</b>\n'
+                    f'💻 Имя: <code>{html.escape(hostname)}</code> ({html.escape(os_name)})\n'
+                    f'🤖 Бот на связи и готов к командам.'
+                )
+                await self._notify_admins(startup_msg)
+                self._save_last_notified_boot_time(boot_time)
         except Exception as notify_exc:
             self.log_message.emit(f'Failed to send startup notification: {notify_exc}')
 
@@ -3298,6 +3690,7 @@ class TelegramBotService(QObject):
 
                 # --- Детектор выхода из сна / гибернации ---
                 if now - last_tick > 15.0:
+                    self._resume_notification_pending = True
                     self.log_message.emit('⏳ Выход из сна! Сбрасываю сетевые соединения...')
                     break
                 last_tick = now
@@ -3343,6 +3736,9 @@ class TelegramBotService(QObject):
             if hasattr(self, '_pending_rename_by_user'): self._pending_rename_by_user.clear()
             if hasattr(self, '_aa_menu_messages'): self._aa_menu_messages.clear()
             if hasattr(self, '_menu_msg_id_by_user'): self._menu_msg_id_by_user.clear()
+            if hasattr(self, '_media_menu_msg_id_by_user'): self._media_menu_msg_id_by_user.clear()
+            if hasattr(self, '_live_stream_stop_events'): self._live_stream_stop_events.clear()
+            if hasattr(self, '_live_stream_tasks'): self._live_stream_tasks.clear()
             if hasattr(self, '_dir_items_by_user'): self._dir_items_by_user.clear()
 
             self.log_message.emit('Bot stopped.')

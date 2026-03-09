@@ -37,6 +37,14 @@ def is_security_active() -> bool:
     return _security_active
 
 
+def _open_webcam_capture(cv2_module):
+    cap = cv2_module.VideoCapture(0, cv2_module.CAP_DSHOW)
+    if cap.isOpened():
+        return cap
+    cap.release()
+    return cv2_module.VideoCapture(0)
+
+
 def start_security(on_motion_callback: Callable[[bytes, bytes], None]) -> object:
     from .system_actions import CommandResult
     global _security_active, _security_thread
@@ -98,9 +106,7 @@ def start_security(on_motion_callback: Callable[[bytes, bytes], None]) -> object
         # --------------------------------------------------------
 
         with media_lock:
-            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
+            cap = _open_webcam_capture(cv2)
             if not cap.isOpened():
                 _security_active = False
                 return
@@ -112,9 +118,24 @@ def start_security(on_motion_callback: Callable[[bytes, bytes], None]) -> object
             # Буфер на 3 секунды видео
             frame_buffer = deque(maxlen=int(fps * 3))
 
-            for _ in range(10): cap.read()
-            ret, frame1 = cap.read()
-            ret, frame2 = cap.read()
+            for _ in range(10):
+                cap.read()
+
+            # Сначала заполняем буфер, чтобы тревога всегда включала 3 секунды ДО события.
+            while _security_active and len(frame_buffer) < frame_buffer.maxlen:
+                ret, buffered_frame = cap.read()
+                if not ret:
+                    break
+                frame_buffer.append(buffered_frame.copy())
+                time.sleep(1.0 / fps)
+
+            if len(frame_buffer) < 2:
+                cap.release()
+                _security_active = False
+                return
+
+            frame1 = frame_buffer[-2].copy()
+            frame2 = frame_buffer[-1].copy()
             motion_detected = False
 
             while _security_active and not motion_detected:
@@ -148,6 +169,7 @@ def start_security(on_motion_callback: Callable[[bytes, bytes], None]) -> object
 
                 at.join(timeout=2.0)  # Ждем пока аудио допишет свои 5 секунд
 
+                at.join(timeout=4.0)
                 import tempfile, os
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
@@ -250,7 +272,7 @@ def capture_webcam_photo() -> tuple[bytes, str]:
 
     import cv2
     with media_lock:
-        cap = cv2.VideoCapture(0)
+        cap = _open_webcam_capture(cv2)
         if not cap.isOpened():
             raise RuntimeError('Не удалось открыть веб-камеру.')
         try:
@@ -275,7 +297,7 @@ def capture_webcam_video(duration_seconds: int = 5) -> tuple[bytes, str]:
 
     import cv2
     with media_lock:
-        cap = cv2.VideoCapture(0)
+        cap = _open_webcam_capture(cv2)
         if not cap.isOpened():
             raise RuntimeError('Не удалось открыть веб-камеру.')
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -316,7 +338,7 @@ def record_audio(duration_seconds: int = 5) -> tuple[bytes, str]:
             stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
             frames = []
             for _ in range(0, int(RATE / CHUNK * duration_seconds)):
-                data = stream.read(CHUNK)
+                data = stream.read(CHUNK, exception_on_overflow=False)
                 frames.append(data)
             stream.stop_stream()
             stream.close()
