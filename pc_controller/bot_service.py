@@ -3053,12 +3053,22 @@ class TelegramBotService(QObject):
             self.log_message.emit(f'Failed to send startup notification: {notify_exc}')
 
         try:
+            last_tick = time.time()
             while not self._stop_event.is_set():
                 if self._application and self._application.updater:
                     if not self._application.updater.running:
                         self.log_message.emit('⚠️ Соединение с Telegram потеряно!')
                         break
+
                 await asyncio.sleep(0.5)
+
+                # --- Детектор выхода из сна / гибернации ---
+                now = time.time()
+                if now - last_tick > 15.0:
+                    self.log_message.emit('⏳ Обнаружен выход из сна/гибернации! Сбрасываю сетевые соединения...')
+                    break  # Выход из цикла заставит скрипт мягко перезапустить бота
+                last_tick = now
+                # ---------------------------------------------
         finally:
             self.log_message.emit('Stopping bot...')
             if self._hibernate_task and not self._hibernate_task.done():
