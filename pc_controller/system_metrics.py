@@ -37,7 +37,7 @@ def is_security_active() -> bool:
     return _security_active
 
 
-def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
+def start_security(on_motion_callback: Callable[[bytes, bytes], None]) -> object:
     from .system_actions import CommandResult
     global _security_active, _security_thread
     if _security_active: return CommandResult(False, "Охрана уже включена.")
@@ -45,9 +45,58 @@ def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
 
     def _loop():
         global _security_active
-
         import cv2
         import numpy as np
+        import threading
+        from collections import deque
+        import time
+
+        # --- Инициализация микрофона (Пишет звук за 3 сек ДО) ---
+        audio_data = [None]
+        motion_event = threading.Event()
+
+        def _audio_loop():
+            try:
+                import pyaudio, wave
+                from io import BytesIO
+                CHUNK, FORMAT, CHANNELS, RATE = 1024, pyaudio.paInt16, 1, 44100
+                p = pyaudio.PyAudio()
+                stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+                # Буфер на 3 секунды звука (около 129 чанков)
+                audio_buffer = deque(maxlen=int(RATE / CHUNK * 3))
+
+                # Постоянно слушаем и стираем старое, пока нет движения
+                while _security_active and not motion_event.is_set():
+                    audio_buffer.append(stream.read(CHUNK, exception_on_overflow=False))
+
+                # ДВИЖЕНИЕ ОБНАРУЖЕНО! Пишем еще 5 секунд звука
+                if motion_event.is_set() and _security_active:
+                    audio_post = []
+                    for _ in range(int(RATE / CHUNK * 5)):
+                        audio_post.append(stream.read(CHUNK, exception_on_overflow=False))
+
+                    # Склеиваем 3 сек "ДО" и 5 сек "ПОСЛЕ"
+                    output = BytesIO()
+                    wf = wave.open(output, 'wb')
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(p.get_sample_size(FORMAT))
+                    wf.setframerate(RATE)
+                    wf.writeframes(b''.join(audio_buffer) + b''.join(audio_post))
+                    wf.close()
+                    audio_data[0] = output.getvalue()
+
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+            except Exception:
+                pass
+
+        # Запускаем звук параллельно камере
+        at = threading.Thread(target=_audio_loop, daemon=True)
+        at.start()
+        # --------------------------------------------------------
+
         with media_lock:
             cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             if not cap.isOpened():
@@ -60,19 +109,16 @@ def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            # Буфер для 3 секунд "ДО" момента (fps * 3)
+            # Буфер на 3 секунды видео
             frame_buffer = deque(maxlen=int(fps * 3))
 
-            # Прогрев и адаптация к свету
             for _ in range(10): cap.read()
-
             ret, frame1 = cap.read()
             ret, frame2 = cap.read()
             motion_detected = False
 
             while _security_active and not motion_detected:
                 frame_buffer.append(frame1.copy())
-
                 diff = cv2.absdiff(frame1, frame2)
                 gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
                 blur = cv2.GaussianBlur(gray, (21, 21), 0)
@@ -91,7 +137,8 @@ def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
                 time.sleep(0.04)
 
             if motion_detected and _security_active:
-                # Записываем 5 секунд "ПОСЛЕ" момента
+                motion_event.set()  # Сигнализируем микрофону начать запись "ПОСЛЕ"
+
                 post_frames = []
                 for _ in range(int(fps * 5)):
                     ret, f = cap.read()
@@ -99,7 +146,9 @@ def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
                     post_frames.append(f)
                     time.sleep(0.04)
 
-                # Сборка итогового видео
+                at.join(timeout=2.0)  # Ждем пока аудио допишет свои 5 секунд
+
+                import tempfile, os
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
                     tmp_path = tmp.name
@@ -110,19 +159,24 @@ def start_security(on_motion_callback: Callable[[bytes], None]) -> object:
                 out.release()
 
                 with open(tmp_path, 'rb') as f:
-                    on_motion_callback(f.read())
+                    video_bytes = f.read()
 
                 try:
                     os.remove(tmp_path)
                 except:
                     pass
 
+                cap.release()
+                _security_active = False
+                on_motion_callback(video_bytes, audio_data[0])
+                return
+
             cap.release()
             _security_active = False
 
     _security_thread = threading.Thread(target=_loop, daemon=True)
     _security_thread.start()
-    return CommandResult(True, "🚨 Охрана включена (Запись видео 3с до + 5с после).")
+    return CommandResult(True, "🚨 Охрана включена (Запись видео и звука: 3с до + 5с после).")
 
 
 def stop_security() -> object:

@@ -532,11 +532,11 @@ class TelegramBotService(QObject):
         try:
             from .input_actions import press_media_key
             if direction == 'up':
-                for _ in range(3): await asyncio.to_thread(press_media_key, 0xAF)
+                for _ in range(5): await asyncio.to_thread(press_media_key, 0xAF)
                 await self._safe_reply(update, '🔊 <b>Громкость +</b>', parse_mode=ParseMode.HTML, dismissable=True,
                                        as_toast=True)
             elif direction == 'down':
-                for _ in range(3): await asyncio.to_thread(press_media_key, 0xAE)
+                for _ in range(5): await asyncio.to_thread(press_media_key, 0xAE)
                 await self._safe_reply(update, '🔉 <b>Громкость -</b>', parse_mode=ParseMode.HTML, dismissable=True,
                                        as_toast=True)
             elif direction == 'mute':
@@ -787,46 +787,58 @@ class TelegramBotService(QObject):
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'media'): return
 
-        duration = 15  # По умолчанию стримим 15 секунд
+        duration = 15
         if context.args:
             try:
                 duration = max(5, min(60, int(context.args[0])))
             except ValueError:
                 pass
 
-        msg = await self._send_temporary_status(update, f"📡 <b>Запуск LIVE-трансляции ({duration}с)...</b>")
-        end_time = time.time() + duration
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text(f'📡 <b>Запуск LIVE-трансляции ({duration}с)...</b>',
+                                          parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update, f"📡 <b>Запуск LIVE-трансляции ({duration}с)...</b>")
 
+        end_time = time.time() + duration
         first_frame = True
-        last_msg = msg
+        last_msg = None
 
         try:
+            from telegram import InputMediaPhoto
             while time.time() < end_time and self._running:
                 screenshot_bytes, file_name = await asyncio.to_thread(capture_screenshot_bytes)
+                current_time = time.strftime('%H:%M:%S')
+                caption_text = f"🔴 <b>LIVE: Трансляция экрана</b>\n<i>Обновлено: {current_time}</i>"
+
+                # КРИТИЧЕСКИ ВАЖНО: Оборачиваем в BytesIO и даем имя файлу, иначе Телеграм не обновит фото!
                 stream = BytesIO(screenshot_bytes)
                 stream.name = file_name
 
                 if first_frame:
+                    if query:
+                        await query.message.delete()
+                    elif temp_msg:
+                        await self._delete_message_safe(temp_msg)
+
                     if update.effective_chat:
                         last_msg = await update.effective_chat.send_photo(
                             photo=stream,
-                            caption="🔴 <b>LIVE: Трансляция экрана</b>\n<i>Обновление каждые ~2 сек...</i>",
+                            caption=caption_text,
                             parse_mode=ParseMode.HTML,
                             reply_markup=self._dismiss_markup()
                         )
-                    await self._delete_message_safe(msg)
                     first_frame = False
                 else:
-                    media = InputMediaPhoto(media=stream,
-                                            caption="🔴 <b>LIVE: Трансляция экрана</b>\n<i>Обновление каждые ~2 сек...</i>",
-                                            parse_mode=ParseMode.HTML)
+                    media = InputMediaPhoto(media=stream, caption=caption_text, parse_mode=ParseMode.HTML)
                     try:
                         await last_msg.edit_media(media=media, reply_markup=self._dismiss_markup())
                     except Exception as e:
                         if "Message is not modified" not in str(e):
-                            pass  # Игнорируем мелкие сетевые ошибки при быстрой замене
+                            self.log_message.emit(f"Ошибка кадра трансляции: {e}")  # Теперь мы увидим ошибку в логах
 
-                # Ждем 2 секунды, чтобы Telegram не забанил нас за спам запросами (Flood Limit)
                 await asyncio.sleep(2.0)
 
         except Exception as exc:
@@ -839,51 +851,79 @@ class TelegramBotService(QObject):
             except:
                 pass
 
+            if query:
+                await self._safe_reply(update, self._panel_media_text(), reply_markup=self._panel_media_markup(),
+                                       parse_mode=ParseMode.HTML)
+
     async def _command_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'media'): return
 
-        temp_msg = await self._send_temporary_status(update,
-                                                     '🕵️‍♂️ <b>Собираю полный отчет (Экран + Вебка + 5с Аудио)...</b>\n<i>Подождите около 7 секунд.</i>')
+        query = update.callback_query
+        temp_msg = None
+        if query:
+            await query.edit_message_text('🕵️‍♂️ <b>Собираю отчет (Экран + Вебка + 5с Аудио)...</b>',
+                                          parse_mode=ParseMode.HTML)
+        else:
+            temp_msg = await self._send_temporary_status(update,
+                                                         '🕵️‍♂️ <b>Собираю отчет (Экран + Вебка + 5с Аудио)...</b>')
+
         try:
             from .system_metrics import capture_screenshot_bytes, capture_webcam_photo, record_audio
-
-            # Собираем данные последовательно, так как камера и микрофон делят media_lock
             screen_bytes, screen_name = await asyncio.to_thread(capture_screenshot_bytes)
 
-            webcam_bytes, webcam_name = None, None
+            webcam_bytes, webcam_name, webcam_err = None, None, None
             try:
                 webcam_bytes, webcam_name = await asyncio.to_thread(capture_webcam_photo)
-            except Exception:
-                pass
+            except Exception as e:
+                webcam_err = str(e)  # Захватываем текст ошибки, чтобы показать тебе
 
-            audio_bytes, audio_name = None, None
+            audio_bytes, audio_name, audio_err = None, None, None
             try:
                 audio_bytes, audio_name = await asyncio.to_thread(record_audio, 5)
-            except Exception:
-                pass
+            except Exception as e:
+                audio_err = str(e)  # Захватываем текст ошибки аудио
 
-            await self._delete_message_safe(temp_msg)
+            if query:
+                await query.edit_message_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await temp_msg.edit_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
 
             if update.effective_chat:
-                await update.effective_chat.send_photo(photo=BytesIO(screen_bytes), caption="🖼 <b>Экран</b>",
+                # Отправка экрана
+                s_stream = BytesIO(screen_bytes)
+                s_stream.name = screen_name
+                await update.effective_chat.send_photo(photo=s_stream, caption="🖼 <b>Экран</b>",
                                                        parse_mode=ParseMode.HTML)
 
+                # Отправка вебки
                 if webcam_bytes:
-                    await update.effective_chat.send_photo(photo=BytesIO(webcam_bytes), caption="📸 <b>Веб-камера</b>",
+                    w_stream = BytesIO(webcam_bytes)
+                    w_stream.name = webcam_name
+                    await update.effective_chat.send_photo(photo=w_stream, caption="📸 <b>Веб-камера</b>",
                                                            parse_mode=ParseMode.HTML)
                 else:
                     await update.effective_chat.send_message(
-                        "❌ <b>Веб-камера:</b> Недоступна (Возможно работает охрана)", parse_mode=ParseMode.HTML)
+                        f"❌ <b>Веб-камера:</b> Недоступна\n<i>Причина: {webcam_err}</i>", parse_mode=ParseMode.HTML)
 
+                # Отправка микрофона
                 if audio_bytes:
-                    await update.effective_chat.send_voice(voice=BytesIO(audio_bytes),
-                                                           caption="🎙 <b>Окружение (5с)</b>", parse_mode=ParseMode.HTML)
+                    a_stream = BytesIO(audio_bytes)
+                    a_stream.name = audio_name
+                    await update.effective_chat.send_voice(voice=a_stream, caption="🎙 <b>Окружение (5с)</b>",
+                                                           parse_mode=ParseMode.HTML)
                 else:
-                    await update.effective_chat.send_message("❌ <b>Микрофон:</b> Недоступен", parse_mode=ParseMode.HTML)
+                    await update.effective_chat.send_message(
+                        f"❌ <b>Микрофон:</b> Недоступен\n<i>Причина: {audio_err}</i>", parse_mode=ParseMode.HTML)
 
         except Exception as exc:
-            await self._safe_reply(update, f"❌ Ошибка сбора отчета: {exc}", dismissable=True)
+            await self._safe_reply(update, f"❌ Ошибка отчета: {exc}", dismissable=True)
+        finally:
+            if query:
+                await query.edit_message_text(self._panel_media_text(), reply_markup=self._panel_media_markup(),
+                                              parse_mode=ParseMode.HTML)
+            elif temp_msg:
+                await self._delete_message_safe(temp_msg)
 
     async def _command_lock(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1950,12 +1990,10 @@ class TelegramBotService(QObject):
         finally:
             self._timer_targets.pop(tid, None)
 
-    def _on_security_motion(self, image_bytes: bytes):
-        loop = self._loop
-        if loop:
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._notify_motion(image_bytes)))
+    def _on_security_motion(self, video_bytes: bytes, audio_bytes: bytes | None = None):
+        asyncio.run_coroutine_threadsafe(self._notify_motion(video_bytes, audio_bytes), self._loop)
 
-    async def _notify_motion(self, video_bytes: bytes):
+    async def _notify_motion(self, video_bytes: bytes, audio_bytes: bytes | None = None):
         text = "🚨 <b>ВНИМАНИЕ! ЗАМЕЧЕНО ДВИЖЕНИЕ!</b> 🚨\n<i>Запись 3с до и 5с после. Охрана автоматически выключена.</i>"
         stream = BytesIO(video_bytes)
         stream.name = 'alert.mp4'
@@ -1964,9 +2002,17 @@ class TelegramBotService(QObject):
         for admin_id in self._config_provider().admins.keys():
             try:
                 stream.seek(0)
-                await self._application.bot.send_video(chat_id=admin_id, video=stream, caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await self._application.bot.send_video(chat_id=admin_id, video=stream, caption=text,
+                                                       parse_mode=ParseMode.HTML, reply_markup=markup)
 
-                # Обновляем меню (если оно открыто), чтобы сбросить кнопку Охраны
+                # Отправляем аудио с места событий
+                if audio_bytes:
+                    a_stream = BytesIO(audio_bytes)
+                    a_stream.name = 'alert_audio.wav'
+                    await self._application.bot.send_voice(chat_id=admin_id, voice=a_stream,
+                                                           caption="🎙 <b>Звук с места событий (8 сек)</b>",
+                                                           parse_mode=ParseMode.HTML)
+
                 msg_id = self._menu_msg_id_by_user.get(int(admin_id))
                 if msg_id:
                     try:
@@ -1975,8 +2021,10 @@ class TelegramBotService(QObject):
                             text=self._panel_media_text(), reply_markup=self._panel_media_markup(),
                             parse_mode=ParseMode.HTML
                         )
-                    except: pass
-            except: pass
+                    except:
+                        pass
+            except:
+                pass
 
     async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -2005,7 +2053,8 @@ class TelegramBotService(QObject):
             wav_path.unlink(missing_ok=True)
 
             text = text.lower()
-            reply = f"🗣 <b>Голос:</b> <i>{text}</i>\n\n"
+            # Заменяем статус-сообщение на распознанный текст (чтобы ты видел, что он услышал)
+            await status_msg.edit_text(f"🗣 <b>Голос:</b> <i>{text}</i>", parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
 
             # --- Умный парсинг всех команд ---
             if "таймер" in text:
@@ -2019,87 +2068,104 @@ class TelegramBotService(QObject):
                     task = asyncio.create_task(self._start_overlay_timer(val * 60, "Таймер", tid))
                     self._active_timers[tid] = (task, f"⏳ Таймер {val} мин")
                     task.add_done_callback(lambda t, timer_id=tid: self._active_timers.pop(timer_id, None))
-                    reply += f"⏱ Таймер на {val} мин запущен на экране."
+                    await self._safe_reply(update, f"⏱ Таймер на {val} мин запущен на экране.", dismissable=True)
                 else:
-                    reply += "⚠️ Таймер запрошен, но я не понял время. Скажи например: 'Таймер 5 минут'."
+                    await self._safe_reply(update, "⚠️ Не понял время. Скажи: 'Таймер 5 минут'.", dismissable=True)
             elif "напомни" in text:
                 parts = text.split("напомни", 1)
                 reminder = parts[1].strip() if len(parts) > 1 else "Напоминание!"
                 self.overlay_show_signal.emit(f"📌 Напоминание:<br>{reminder.capitalize()}", "center", True)
-                reply += "📌 Напоминание выведено поверх окон."
-            elif "убери" in text or "скрой" in text or "закрой" in text:
+                await self._safe_reply(update, "📌 Напоминание выведено на экран.", dismissable=True)
+            elif "убери" in text or "скрой" in text:
                 self.overlay_hide_signal.emit()
-                reply += "👀 Оверлей скрыт."
+                await self._safe_reply(update, "👀 Оверлей скрыт.", dismissable=True)
             elif "скриншот" in text or "снимок экрана" in text:
                 await self._command_screenshot(update, context)
-                return
             elif "отчет" in text or "шпион" in text:
                 await self._command_report(update, context)
-                return
             elif "стрим" in text or "трансляция" in text:
                 await self._command_stream(update, context)
-                return
             elif "вебк" in text or "камер" in text or "фотк" in text:
                 await self._command_webcam(update, context)
-                return
             elif "запиши звук" in text or "диктофон" in text or "микрофон" in text:
                 await self._command_audio(update, context)
-                return
             elif "статус" in text or "состояние" in text or "как дела" in text:
                 await self._command_status(update, context)
-                return
-            elif "заблокир" in text or "блок" in text:
-                await self._command_lock(update, context)
-                return
             elif "спящ" in text or "сон" in text:
                 await self._command_sleep(update, context)
-                return
-            elif "перезагрузи" in text or "рестарт" in text or "ребут" in text:
+            elif "гибернац" in text:
+                await self._command_hibernate(update, context)
+            elif "заблокируй" in text or "блок" in text:
+                await self._command_lock(update, context)
+            elif "перезагрузи" in text or "рестарт" in text:
                 cloned = self._clone_context_with_args(context, ['0'])
                 await self._command_reboot(update, cloned)
-                return
+            elif "выключи" in text and "комп" in text:
+                cloned = self._clone_context_with_args(context, ['0'])
+                await self._command_shutdown(update, cloned)
+            elif "закрой окно" in text or "закрыть окно" in text:
+                cloned = self._clone_context_with_args(context, ['alt', 'f4'])
+                await self._command_combination(update, cloned)
+            elif "сверни" in text:
+                cloned = self._clone_context_with_args(context, ['win', 'd'])
+                await self._command_combination(update, cloned)
+            elif "напечатай" in text or "напиши" in text:
+                parts = text.split(maxsplit=1)
+                if len(parts) > 1 and parts[1].strip():
+                    cloned = self._clone_context_with_args(context, parts[1].strip().split())
+                    await self._command_printtext(update, cloned)
+            elif "нажми" in text:
+                parts = text.split("нажми", 1)
+                if len(parts) > 1 and parts[1].strip():
+                    keys_str = parts[1].strip()
+                    keys_str = keys_str.replace("ентер", "enter").replace("пробел", "space").replace("эскейп", "esc")
+                    keys_str = keys_str.replace("альт", "alt").replace("шифт", "shift").replace("контрол", "ctrl")
+                    keys_str = keys_str.replace("таб", "tab").replace("виндовс", "win").replace("окно", "win")
+                    cloned = self._clone_context_with_args(context, keys_str.split())
+                    await self._command_combination(update, cloned)
+            elif "клик" in text or "пкм" in text or "лкм" in text or "даблклик" in text or "дабл клик" in text:
+                if "правый" in text or "пкм" in text:
+                    await self._command_rightclick(update, context)
+                elif "двойной" in text or "даблклик" in text or "дабл клик" in text:
+                    await self._command_leftdoubleclick(update, context)
+                else:
+                    await self._command_leftclick(update, context)
+            elif "автоприняти" in text or "автоаццепт" in text or "автоацепт" in text:
+                if "выключи" in text or "стоп" in text or "останови" in text:
+                    await self._command_autoaccept_off(update, context)
+                else:
+                    await self._command_autoaccept_on(update, context)
             elif "громче" in text or "прибавь звук" in text:
                 cloned = self._clone_context_with_args(context, ['up'])
                 await self._command_vol(update, cloned)
-                return
             elif "тише" in text or "убавь звук" in text:
                 cloned = self._clone_context_with_args(context, ['down'])
                 await self._command_vol(update, cloned)
-                return
-            elif "без звука" in text or "заглуши" in text or "мут" in text or "мьют" in text:
+            elif "без звука" in text or "заглуши" in text or "мут" in text:
                 cloned = self._clone_context_with_args(context, ['mute'])
                 await self._command_vol(update, cloned)
-                return
             elif "спотифай" in text or "музык" in text or "трек" in text or "песн" in text:
                 if "следующ" in text or "дальше" in text:
                     await self._command_nexttrack(update, context)
-                    return
                 elif "предыдущ" in text or "прошл" in text or "назад" in text:
                     await self._command_prevtrack(update, context)
-                    return
                 elif "что" in text and ("играет" in text or "за" in text):
                     await self._command_music(update, context)
-                    return
                 else:
                     await self._command_playpause(update, context)
-                    return
             elif "охрана" in text or "охран" in text:
                 if "включи" in text or "вруби" in text or "активир" in text:
                     from .system_metrics import start_security, is_security_active
                     await asyncio.to_thread(start_security, self._on_security_motion)
-                    reply += "🚨 Охранная система включена."
+                    await self._safe_reply(update, "🚨 Охранная система включена.", dismissable=True)
                 else:
                     from .system_metrics import stop_security
                     await asyncio.to_thread(stop_security)
-                    reply += "🛡 Охранная система выключена."
-            elif "выключи" in text and "комп" in text:
-                cloned = self._clone_context_with_args(context, ['0'])
-                await self._command_shutdown(update, cloned)
-                return
+                    await self._safe_reply(update, "🛡 Охранная система выключена.", dismissable=True)
             else:
-                reply += "🤷‍♂️ <b>Команда не распознана.</b>\nЯ научился понимать: <i>стрим, скриншот, вебка, микрофон, отчет, перезагрузи, заблокируй, статус, музыку, громче/тише...</i>"
-
-            await status_msg.edit_text(reply, parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
+                await self._safe_reply(update,
+                                       "🤷‍♂️ <b>Команда не распознана.</b>\nПопробуй: <i>напечатай привет, нажми альт таб, автопринятие, гибернация, стрим...</i>",
+                                       parse_mode=ParseMode.HTML, dismissable=True)
 
         except sr.UnknownValueError:
             await status_msg.edit_text("🤷‍♂️ <b>Речь не распознана. Повторите четче.</b>", parse_mode=ParseMode.HTML,
