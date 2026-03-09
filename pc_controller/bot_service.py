@@ -3107,14 +3107,14 @@ class TelegramBotService(QObject):
                 self._loop.run_until_complete(self._runner())
                 if self._stop_event.is_set():
                     break
-                self.log_message.emit('🔄 Бот завис. Идет автоматический перезапуск...')
+                self.log_message.emit('🔄 Перезапуск сетевой сессии...')
             except Exception as exc:
-                self.log_message.emit(f'Нет сети или ошибка старта: {exc}. Повтор через 10 сек...')
+                self.log_message.emit(f'⚠️ Ошибка сети: {exc}. Повтор через 5 сек...')
 
             self._running = False
             self.state_changed.emit(False)
 
-            if self._stop_event.wait(10.0):
+            if self._stop_event.wait(5.0):
                 break
 
         self._running = False
@@ -3218,34 +3218,55 @@ class TelegramBotService(QObject):
 
         try:
             last_tick = time.time()
+            last_net_check = time.time()
+            network_fails = 0
+
             while not self._stop_event.is_set():
                 if self._application and self._application.updater:
                     if not self._application.updater.running:
-                        self.log_message.emit('⚠️ Соединение с Telegram потеряно!')
+                        self.log_message.emit('⚠️ Внутренний пуллинг Telegram остановился!')
                         break
 
                 await asyncio.sleep(0.5)
+                now = time.time()
 
                 # --- Детектор выхода из сна / гибернации ---
-                now = time.time()
                 if now - last_tick > 15.0:
-                    self.log_message.emit('⏳ Обнаружен выход из сна/гибернации! Сбрасываю сетевые соединения...')
-                    break  # Выход из цикла заставит скрипт мягко перезапустить бота
+                    self.log_message.emit('⏳ Выход из сна! Сбрасываю сетевые соединения...')
+                    break
                 last_tick = now
-                # ---------------------------------------------
+
+                # --- Активный детектор смены сети / VPN ---
+                if now - last_net_check > 5.0:
+                    last_net_check = now
+                    try:
+                        # Делаем сверхбыстрый "стук" в сервер Telegram для проверки маршрута
+                        fut = asyncio.open_connection('api.telegram.org', 443)
+                        reader, writer = await asyncio.wait_for(fut, timeout=2.0)
+                        writer.close()
+                        await writer.wait_closed()
+                        network_fails = 0
+                    except Exception:
+                        network_fails += 1
+
+                    if network_fails >= 3:  # 15 секунд сеть мертва
+                        self.log_message.emit('🌐 Смена VPN или обрыв интернета! Принудительный рестарт...')
+                        break
         finally:
-            self.log_message.emit('Stopping bot...')
+            self.log_message.emit('Очистка соединений...')
             if self._hibernate_task and not self._hibernate_task.done():
                 self._hibernate_task.cancel()
 
             try:
+                # ОЧЕНЬ ВАЖНО: Оборачиваем остановку в wait_for.
+                # Иначе при мертвом VPN бот зависнет навсегда, пытаясь закрыть сокет!
                 if self._application and self._application.updater:
-                    await self._application.updater.stop()
+                    await asyncio.wait_for(self._application.updater.stop(), timeout=3.0)
                 if self._application:
-                    await self._application.stop()
-                    await self._application.shutdown()
-            except Exception as cleanup_exc:
-                self.log_message.emit(f'Cleanup warning: {cleanup_exc}')
+                    await asyncio.wait_for(self._application.stop(), timeout=3.0)
+                    await asyncio.wait_for(self._application.shutdown(), timeout=3.0)
+            except Exception:
+                self.log_message.emit('Уничтожение зависших сокетов...')
 
             self._application = None
             await asyncio.to_thread(self._auto_accept_service.stop)
