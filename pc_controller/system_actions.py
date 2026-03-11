@@ -20,29 +20,29 @@ def parse_delay(raw_value: str | None, default_seconds: int = 30) -> int:
         return default_seconds
     value = int(raw_value)
     if value < 0 or value > 86_400:
-        raise ValueError('Delay should be between 0 and 86400 seconds.')
+        raise ValueError('Задержка должна быть от 0 до 86400 секунд.')
     return value
 
 
 def _ensure_windows() -> None:
     if sys.platform != 'win32':
-        raise RuntimeError('This feature is only available on Windows.')
+        raise RuntimeError('Эта функция доступна только в Windows.')
 
 
 def schedule_shutdown(seconds: int = 30) -> CommandResult:
     _ensure_windows()
     subprocess.run(['shutdown', '/s', '/t', str(seconds)], check=True, capture_output=True, text=True)
     if seconds:
-        return CommandResult(True, f'Shutdown scheduled in {seconds} seconds.')
-    return CommandResult(True, 'Shutdown scheduled immediately.')
+        return CommandResult(True, f'Выключение запланировано через {seconds} сек.')
+    return CommandResult(True, 'Выключение запланировано немедленно.')
 
 
 def schedule_reboot(seconds: int = 30) -> CommandResult:
     _ensure_windows()
     subprocess.run(['shutdown', '/r', '/t', str(seconds)], check=True, capture_output=True, text=True)
     if seconds:
-        return CommandResult(True, f'Reboot scheduled in {seconds} seconds.')
-    return CommandResult(True, 'Reboot scheduled immediately.')
+        return CommandResult(True, f'Перезагрузка запланирована через {seconds} сек.')
+    return CommandResult(True, 'Перезагрузка запланирована немедленно.')
 
 
 def cancel_scheduled_power_action() -> CommandResult:
@@ -52,17 +52,17 @@ def cancel_scheduled_power_action() -> CommandResult:
     except subprocess.CalledProcessError as exc:
         # Windows returns 1116 when there is nothing to abort.
         if exc.returncode == 1116:
-            return CommandResult(True, 'No scheduled shutdown/reboot was pending.', code='not_pending')
+            return CommandResult(True, 'Отложенное выключение или перезагрузка не были запланированы.', code='not_pending')
         raise
-    return CommandResult(True, 'Scheduled power action cancelled.', code='cancelled')
+    return CommandResult(True, 'Отложенное выключение или перезагрузка отменены.', code='cancelled')
 
 
 def lock_workstation() -> CommandResult:
     _ensure_windows()
     user32 = ctypes.WinDLL('user32', use_last_error=True)
     if user32.LockWorkStation() == 0:
-        raise OSError(ctypes.get_last_error(), 'Unable to lock workstation.')
-    return CommandResult(True, 'Workstation locked.')
+        raise OSError(ctypes.get_last_error(), 'Не удалось заблокировать компьютер.')
+    return CommandResult(True, 'Компьютер заблокирован.')
 
 
 def sleep_system() -> CommandResult:
@@ -70,14 +70,14 @@ def sleep_system() -> CommandResult:
     powrprof = ctypes.WinDLL('powrprof', use_last_error=True)
     ok = powrprof.SetSuspendState(False, True, False)
     if ok == 0:
-        raise OSError(ctypes.get_last_error(), 'Unable to suspend system.')
-    return CommandResult(True, 'Sleep mode requested.')
+        raise OSError(ctypes.get_last_error(), 'Не удалось перевести компьютер в спящий режим.')
+    return CommandResult(True, 'Переход в спящий режим выполнен.')
 
 
 def hibernate_system() -> CommandResult:
     _ensure_windows()
     subprocess.run(['shutdown', '/h'], check=True, capture_output=True, text=True)
-    return CommandResult(True, 'Hibernate requested.')
+    return CommandResult(True, 'Гибернация включена.')
 
 
 def open_url(url: str) -> CommandResult:

@@ -1015,20 +1015,29 @@ class TelegramBotService(QObject):
             elif temp_msg:
                 await self._delete_message_safe(temp_msg)
 
+    async def _announce_power_action(self, update: Update, text: str) -> None:
+        await self._safe_reply(
+            update,
+            f'⏳ <b>{html.escape(text)}</b>',
+            parse_mode=ParseMode.HTML,
+            reply_markup=self._power_reply_markup(),
+        )
+        # Let Telegram deliver the status before the PC changes power state.
+        await asyncio.sleep(0.5)
+
     async def _command_lock(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update, 'power'):
             return
 
         try:
+            await self._announce_power_action(update, 'Блокирую компьютер...')
             result = await asyncio.to_thread(lock_workstation)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🔒 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
         except Exception as exc:
             self.log_message.emit(f'Lock command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка блокировки: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _command_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1037,18 +1046,21 @@ class TelegramBotService(QObject):
 
         try:
             delay = parse_delay(context.args[0] if context.args else None)
+            if delay == 0:
+                await self._announce_power_action(update, 'Выключаю компьютер...')
             result = await asyncio.to_thread(schedule_shutdown, delay)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'⏻ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
+            if delay != 0:
+                await self._safe_reply(update, f'⏻ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       reply_markup=self._power_reply_markup())
         except ValueError as exc:
             await self._safe_reply(update,
                                    f'Использование: <code>/shutdown [seconds]</code>\nОшибка: {html.escape(str(exc))}',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
         except Exception as exc:
             self.log_message.emit(f'Shutdown command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка выключения: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _command_reboot(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1057,18 +1069,21 @@ class TelegramBotService(QObject):
 
         try:
             delay = parse_delay(context.args[0] if context.args else None)
+            if delay == 0:
+                await self._announce_power_action(update, 'Перезагружаю компьютер...')
             result = await asyncio.to_thread(schedule_reboot, delay)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
+            if delay != 0:
+                await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       reply_markup=self._power_reply_markup())
         except ValueError as exc:
             await self._safe_reply(update,
                                    f'Использование: <code>/reboot [seconds]</code>\nОшибка: {html.escape(str(exc))}',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
         except Exception as exc:
             self.log_message.emit(f'Reboot command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка перезагрузки: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _command_cancel_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1093,11 +1108,11 @@ class TelegramBotService(QObject):
             self.log_message.emit(message)
             await self._safe_reply(update,
                                    f'✋ <b>{html.escape(message)}</b>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
         except Exception as exc:
             self.log_message.emit(f'Cancel shutdown command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка отмены: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _command_sleep(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1105,14 +1120,13 @@ class TelegramBotService(QObject):
             return
 
         try:
+            await self._announce_power_action(update, 'Перевожу компьютер в спящий режим...')
             result = await asyncio.to_thread(sleep_system)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'🌙 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
         except Exception as exc:
             self.log_message.emit(f'Sleep command failed: {exc}')
             await self._safe_reply(update, f'❌ Ошибка перехода в сон: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _command_hibernate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -1120,13 +1134,12 @@ class TelegramBotService(QObject):
             return
 
         try:
+            await self._announce_power_action(update, 'Перевожу компьютер в гибернацию...')
             result = await asyncio.to_thread(hibernate_system)
             self.log_message.emit(result.message)
-            await self._safe_reply(update, f'❄️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка гибернации: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _command_open_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -2889,24 +2902,24 @@ class TelegramBotService(QObject):
             if action == 'shutdown':
                 result = await asyncio.to_thread(schedule_shutdown, delay)
                 self.log_message.emit(result.message)
-                await self._safe_reply(update, f'⚡️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True, as_toast=True)
+                await self._safe_reply(update, f'⏻ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
+                                       reply_markup=self._power_reply_markup())
             elif action == 'reboot':
                 result = await asyncio.to_thread(schedule_reboot, delay)
                 self.log_message.emit(result.message)
                 await self._safe_reply(update, f'🔄 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                       dismissable=True, as_toast=True)
+                                       reply_markup=self._power_reply_markup())
             elif action == 'hibernate':
                 if self._hibernate_task and not self._hibernate_task.done():
                     self._hibernate_task.cancel()
                 self._hibernate_task = asyncio.create_task(self._delayed_hibernate(update, delay))
                 await self._safe_reply(update, f'⏳ <b>Гибернация запланирована через {delay} сек.</b>',
-                                       parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                                       parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
             else:
                 raise ValueError('Unknown power action.')
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка действия: <code>{html.escape(str(exc))}</code>',
-                                   parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                                   parse_mode=ParseMode.HTML, reply_markup=self._power_reply_markup())
 
     async def _delayed_hibernate(self, update: Update, delay: int) -> None:
         try:
@@ -2914,7 +2927,7 @@ class TelegramBotService(QObject):
             result = await asyncio.to_thread(hibernate_system)
             self.log_message.emit(result.message)
             await self._safe_reply(update, f'❄️ <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML,
-                                   dismissable=True)
+                                   reply_markup=self._power_reply_markup())
         except asyncio.CancelledError:
             pass
 
@@ -3159,6 +3172,13 @@ class TelegramBotService(QObject):
     def _dismiss_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('👌', callback_data='panel:dismiss')]
+        ])
+
+    @staticmethod
+    def _power_reply_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Назад в Питание', callback_data='panel:power'),
+             InlineKeyboardButton('👌 Закрыть', callback_data='panel:dismiss')]
         ])
 
     @staticmethod
