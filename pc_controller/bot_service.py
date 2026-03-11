@@ -140,6 +140,14 @@ ALLOWED_SCHEDULE_ACTIONS = {
     'hwinfo',
     'ocrscreen',
     'clipboard',
+    'tasklist',
+    'windows',
+    'report',
+    'music',
+    'playpause',
+    'nexttrack',
+    'prevtrack',
+    'cancelshutdown',
     'shutdown',
     'reboot',
     'hibernate',
@@ -243,6 +251,19 @@ class TelegramBotService(QObject):
         self._resume_notification_pending = False
         self._startup_state_path = Path(tempfile.gettempdir()) / 'pc_controller_startup_state.json'
         self._last_notified_boot_time = self._load_last_notified_boot_time()
+        self._runtime_lock = threading.Lock()
+        self._runtime_stats: dict[str, float | str | None] = {
+            'last_ping': None,
+            'last_screenshot': None,
+            'last_screenshot_detail': None,
+            'last_webcam': None,
+            'last_webcam_detail': None,
+            'last_ocr': None,
+            'last_ocr_detail': None,
+            'last_successful_reconnect': None,
+            'last_error_time': None,
+            'last_error_message': None,
+        }
 
     def _do_show_overlay(self, text: str, pos: str = "top-right", force: bool = True):
         if not self._overlay_widget:
@@ -281,6 +302,29 @@ class TelegramBotService(QObject):
     def running(self) -> bool:
         return self._running
 
+    def _update_runtime_metrics(self, **changes: float | str | None) -> None:
+        with self._runtime_lock:
+            self._runtime_stats.update(changes)
+
+    def _record_runtime_activity(self, metric_name: str, detail: str | None = None) -> None:
+        updates: dict[str, float | str | None] = {metric_name: time.time()}
+        if detail is not None:
+            updates[f'{metric_name}_detail'] = detail
+        self._update_runtime_metrics(**updates)
+
+    def _record_runtime_error(self, message: str) -> None:
+        self._update_runtime_metrics(
+            last_error_time=time.time(),
+            last_error_message=str(message or '').strip()[:500] or None,
+        )
+
+    def get_runtime_snapshot(self) -> dict[str, float | str | bool | int | None]:
+        with self._runtime_lock:
+            snapshot = dict(self._runtime_stats)
+        snapshot['running'] = self._running
+        snapshot['scheduler_jobs'] = len(self._scheduler_store.list_jobs())
+        return snapshot
+
     def start(self) -> None:
         if self._running:
             self.log_message.emit('Bot is already running.')
@@ -288,9 +332,11 @@ class TelegramBotService(QObject):
 
         config = self._config_provider()
         if not config.bot_token.strip():
+            self._record_runtime_error('Bot token is empty. Set it in settings first.')
             self.log_message.emit('Bot token is empty. Set it in settings first.')
             return
         if not config.admins:
+            self._record_runtime_error('Admins list is empty. Add at least one admin.')
             self.log_message.emit('Admins list is empty. Add at least one admin.')
             return
 
@@ -589,6 +635,7 @@ class TelegramBotService(QObject):
         await self._delete_user_message(update)
         if not await self._ensure_admin(update):
             return
+        self._record_runtime_activity('last_ping')
         await self._safe_reply(update, '🟢 <b>Pong!</b> Связь с ПК установлена.', parse_mode=ParseMode.HTML,
                                dismissable=True)
 
@@ -782,8 +829,10 @@ class TelegramBotService(QObject):
                     read_timeout=60,
                     write_timeout=60
                 )
+            self._record_runtime_activity('last_screenshot', 'экран')
             self.log_message.emit(f'Screenshot sent to admin {update.effective_user.id}.')
         except Exception as exc:
+            self._record_runtime_error(f'Failed to capture screenshot: {exc}')
             self.log_message.emit(f'Failed to capture screenshot: {exc}')
             await self._safe_reply(update, f'❌ Ошибка создания скриншота: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
@@ -826,8 +875,10 @@ class TelegramBotService(QObject):
                     read_timeout=60,
                     write_timeout=60
                 )
+            self._record_runtime_activity('last_webcam', 'фото')
             self.log_message.emit(f'Webcam photo sent to admin {update.effective_user.id}.')
         except Exception as exc:
+            self._record_runtime_error(f'Failed to capture webcam: {exc}')
             self.log_message.emit(f'Failed to capture webcam: {exc}')
             await self._safe_reply(update, f'❌ Ошибка камеры: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
@@ -877,8 +928,10 @@ class TelegramBotService(QObject):
                     read_timeout=120,
                     write_timeout=120
                 )
+            self._record_runtime_activity('last_webcam', f'видео {duration}с')
             self.log_message.emit(f'Webcam video sent to admin {update.effective_user.id}.')
         except Exception as exc:
+            self._record_runtime_error(f'Failed to capture webcam video: {exc}')
             self.log_message.emit(f'Failed to capture webcam video: {exc}')
             await self._safe_reply(update, f'❌ Ошибка камеры: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
@@ -2568,6 +2621,7 @@ class TelegramBotService(QObject):
             screenshot_bytes, _ = await asyncio.to_thread(capture_screenshot_bytes)
             ocr_result = await extract_text_from_image_bytes(screenshot_bytes)
             text = self._format_ocr_report(ocr_result, 'экран', query=query)
+            self._record_runtime_activity('last_ocr', 'экран')
             await self._safe_reply(
                 update,
                 text,
@@ -2575,6 +2629,7 @@ class TelegramBotService(QObject):
                 reply_markup=reply_markup or self._ocr_menu_markup(),
             )
         except Exception as exc:
+            self._record_runtime_error(f'OCR error: {exc}')
             await self._safe_reply(
                 update,
                 f'❌ Ошибка OCR: <code>{html.escape(str(exc))}</code>',
@@ -2590,6 +2645,7 @@ class TelegramBotService(QObject):
             image_bytes, _ = await asyncio.to_thread(capture_window_bytes_for_window, hwnd)
             ocr_result = await extract_text_from_image_bytes(image_bytes)
             text = self._format_ocr_report(ocr_result, f'окно {hwnd}')
+            self._record_runtime_activity('last_ocr', f'окно {hwnd}')
             await self._safe_reply(
                 update,
                 text,
@@ -2597,6 +2653,7 @@ class TelegramBotService(QObject):
                 reply_markup=self._window_reply_markup(hwnd, page),
             )
         except Exception as exc:
+            self._record_runtime_error(f'Window OCR error: {exc}')
             await self._safe_reply(
                 update,
                 f'❌ Ошибка OCR окна: <code>{html.escape(str(exc))}</code>',
@@ -2614,6 +2671,14 @@ class TelegramBotService(QObject):
             'hwinfo': 'железо и датчики',
             'ocrscreen': 'OCR экрана',
             'clipboard': 'буфер обмена',
+            'tasklist': 'список процессов',
+            'windows': 'живые окна',
+            'report': 'полный отчет',
+            'music': 'что играет',
+            'playpause': 'play/pause',
+            'nexttrack': 'следующий трек',
+            'prevtrack': 'предыдущий трек',
+            'cancelshutdown': 'отмена выключения',
             'shutdown': 'выключение',
             'reboot': 'перезагрузка',
             'hibernate': 'гибернация',
@@ -2660,6 +2725,23 @@ class TelegramBotService(QObject):
             'ocrscreen',
             'clipboard',
             'clip',
+            'tasklist',
+            'tasks',
+            'processes',
+            'windows',
+            'windowlist',
+            'report',
+            'music',
+            'track',
+            'playpause',
+            'play',
+            'pause',
+            'nexttrack',
+            'next',
+            'prevtrack',
+            'prev',
+            'cancelshutdown',
+            'cancelpower',
             'screenshot',
             'logsave',
             'shutdown',
@@ -2672,6 +2754,20 @@ class TelegramBotService(QObject):
                 return 'ocrscreen', None
             if raw in {'clipboard', 'clip'}:
                 return 'clipboard', None
+            if raw in {'tasklist', 'tasks', 'processes'}:
+                return 'tasklist', None
+            if raw in {'windows', 'windowlist'}:
+                return 'windows', None
+            if raw in {'music', 'track'}:
+                return 'music', None
+            if raw in {'playpause', 'play', 'pause'}:
+                return 'playpause', None
+            if raw in {'nexttrack', 'next'}:
+                return 'nexttrack', None
+            if raw in {'prevtrack', 'prev'}:
+                return 'prevtrack', None
+            if raw in {'cancelshutdown', 'cancelpower'}:
+                return 'cancelshutdown', None
             return raw, None
 
         webcam_match = re.fullmatch(r'(?:webcamvid|webcam)(?::|=)?(\d+)', raw)
@@ -2768,13 +2864,17 @@ class TelegramBotService(QObject):
 
     async def _ensure_schedule_permissions(self, update: Update, actions: list[str]) -> bool:
         action_names = [self._parse_scheduled_action_spec(action)[0] for action in actions]
-        power_actions = {'shutdown', 'reboot', 'hibernate', 'lock', 'sleep'}
-        media_actions = {'webcam', 'webcamvid', 'audio'}
+        power_actions = {'shutdown', 'reboot', 'hibernate', 'lock', 'sleep', 'cancelshutdown'}
+        media_actions = {'webcam', 'webcamvid', 'audio', 'report', 'music', 'playpause', 'nexttrack', 'prevtrack'}
+        process_actions = {'tasklist', 'windows'}
         if any(action in power_actions for action in action_names):
             if not await self._ensure_admin(update, 'power'):
                 return False
         if any(action in media_actions for action in action_names):
             if not await self._ensure_admin(update, 'media'):
+                return False
+        if any(action in process_actions for action in action_names):
+            if not await self._ensure_admin(update, 'process'):
                 return False
         return await self._ensure_admin(update)
 
@@ -2813,8 +2913,10 @@ class TelegramBotService(QObject):
             '<code>in DELAY actions... [--if-cpu-below N] [--if-cpu-above N] [--if-ram-below N] [--if-ram-above N] [--comment Текст]</code>\n'
             '<code>at HH:MM actions... [--if-cpu-below N] [--if-cpu-above N] [--if-ram-below N] [--if-ram-above N] [--note Текст]</code>\n\n'
             'Действия: <code>screenshot</code>, <code>logsave</code>, <code>status</code>, <code>hwinfo</code>, <code>ocrscreen</code>, <code>clipboard</code>, '
-            '<code>webcam</code>, <code>webcam:15</code>/<code>webcamvid:15</code>, <code>audio:20</code>, <code>lock</code>, <code>sleep</code>, '
-            '<code>hibernate</code>, <code>shutdown</code>, <code>reboot</code>'
+            '<code>tasklist</code>, <code>windows</code>, '
+            '<code>report</code>, <code>music</code>, <code>playpause</code>, <code>nexttrack</code>, <code>prevtrack</code>, <code>webcam</code>, '
+            '<code>webcam:15</code>/<code>webcamvid:15</code>, <code>audio:20</code>, <code>lock</code>, <code>sleep</code>, '
+            '<code>hibernate</code>, <code>cancelshutdown</code>, <code>shutdown</code>, <code>reboot</code>'
         )
 
     @staticmethod
@@ -2832,6 +2934,8 @@ class TelegramBotService(QObject):
             '<code>/schedulein 25m webcam:15 audio:20 --if-cpu-below 12 --comment Ночная проверка</code>\n'
             '<code>/schedulein 2h shutdown --if-cpu-below 10 --if-ram-below 60 --note Выключить если простаивает</code>\n'
             '<code>/schedulein 20m ocrscreen clipboard --if-cpu-above 15 --comment Проверить экран и буфер</code>\n'
+            '<code>/schedulein 15m tasklist windows --comment Что открыто на ПК</code>\n'
+            '<code>/schedulein 10m report music --comment Ночной контроль</code>\n'
             '<code>/scheduleat 03:00 screenshot logsave hwinfo reboot --comment Ночной ребут</code>\n'
             '<code>/jobs</code> • <code>/jobcancel JOB_ID</code>'
         )
@@ -2840,8 +2944,9 @@ class TelegramBotService(QObject):
             f'Активных задач: <code>{len(jobs)}</code>\n\n'
             'Через кнопку ниже можно добавить задачу прямо из панели.\n\n'
             'Поддерживаемые действия: <code>screenshot</code>, <code>logsave</code>, <code>status</code>, <code>hwinfo</code>, <code>ocrscreen</code>, '
-            '<code>clipboard</code>, <code>webcam</code>, <code>webcam:15</code>, <code>audio:20</code>, <code>shutdown</code>, '
-            '<code>reboot</code>, <code>hibernate</code>, <code>lock</code>, <code>sleep</code>\n\n'
+            '<code>clipboard</code>, <code>tasklist</code>, <code>windows</code>, <code>report</code>, <code>music</code>, <code>playpause</code>, <code>nexttrack</code>, <code>prevtrack</code>, '
+            '<code>webcam</code>, <code>webcam:15</code>, <code>audio:20</code>, <code>shutdown</code>, '
+            '<code>reboot</code>, <code>hibernate</code>, <code>cancelshutdown</code>, <code>lock</code>, <code>sleep</code>\n\n'
             f'{examples}'
         )
 
@@ -2876,6 +2981,9 @@ class TelegramBotService(QObject):
             '<code>/schedulein 40m webcam:15 --comment Короткое видео</code>\n'
             '<code>/schedulein 20m ocrscreen --comment Прочитать экран</code>\n'
             '<code>/schedulein 20m clipboard --comment Отправить буфер</code>\n'
+            '<code>/schedulein 15m tasklist windows --comment Что открыто на ПК</code>\n'
+            '<code>/schedulein 15m report --comment Полный отчет</code>\n'
+            '<code>/schedulein 30m music playpause --comment Музыкальная пауза</code>\n'
             '<code>/schedulein 1h sleep --comment Усыпить ПК</code>\n'
             '<code>/schedulein 2h shutdown --if-cpu-below 10 --if-ram-below 60 --note Выключить если простаивает</code>\n'
             '<code>/scheduleat 03:00 reboot --comment Ночной ребут</code>\n'
@@ -2889,9 +2997,15 @@ class TelegramBotService(QObject):
             '• <code>hwinfo</code> — железо и датчики\n'
             '• <code>ocr</code> / <code>ocrscreen</code> — распознать текст с текущего экрана\n'
             '• <code>clip</code> / <code>clipboard</code> — отправить текущий текст из буфера обмена\n'
+            '• <code>tasklist</code> — список процессов с deep-link переходами\n'
+            '• <code>windows</code> — список живых окон с deep-link переходами\n'
+            '• <code>report</code> — экран + вебка + 5с аудио одним пакетом\n'
+            '• <code>music</code> — показать текущий трек\n'
+            '• <code>playpause</code>, <code>nexttrack</code>, <code>prevtrack</code> — управление медиаплеером\n'
             '• <code>webcam</code> — фото с веб-камеры\n'
             '• <code>webcam:15</code> или <code>webcamvid:15</code> — видео с вебки 15 секунд\n'
             '• <code>audio:20</code> — запись микрофона 20 секунд\n'
+            '• <code>cancelshutdown</code> — отменить запланированное выключение/ребут\n'
             '• <code>lock</code>, <code>sleep</code>, <code>hibernate</code>, <code>shutdown</code>, <code>reboot</code>'
         )
 
@@ -3143,6 +3257,7 @@ class TelegramBotService(QObject):
                         file_name,
                         f'🖼 <b>Планировщик:</b> скриншот задачи <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
                     )
+                    self._record_runtime_activity('last_screenshot', 'планировщик')
                     continue
 
                 if action == 'logsave':
@@ -3184,6 +3299,7 @@ class TelegramBotService(QObject):
                     await self._notify_admins(
                         f'🔎 <b>Планировщик:</b> OCR задачи <code>{job.job_id}</code>\n\n{ocr_text}{note_block}'
                     )
+                    self._record_runtime_activity('last_ocr', 'планировщик')
                     continue
 
                 if action == 'clipboard':
@@ -3204,6 +3320,84 @@ class TelegramBotService(QObject):
                     await self._notify_admins(clip_text)
                     continue
 
+                if action == 'tasklist':
+                    bot_username = getattr(getattr(self._application, 'bot', None), 'username', '') or ''
+                    tasklist_text, _ = await asyncio.to_thread(self._build_tasklist_page, '', bot_username, 0)
+                    await self._notify_admins(
+                        f'🔝 <b>Планировщик:</b> процессы по задаче <code>{job.job_id}</code>\n\n{tasklist_text}{note_block}'
+                    )
+                    continue
+
+                if action == 'windows':
+                    bot_username = getattr(getattr(self._application, 'bot', None), 'username', '') or ''
+                    windows_text, _ = await asyncio.to_thread(self._build_windows_page, bot_username, 0)
+                    await self._notify_admins(
+                        f'🪟 <b>Планировщик:</b> окна по задаче <code>{job.job_id}</code>\n\n{windows_text}{note_block}'
+                    )
+                    continue
+
+                if action == 'report':
+                    screen_bytes, screen_name = await asyncio.to_thread(capture_screenshot_bytes)
+                    screen_path = await asyncio.to_thread(self._save_artifact_bytes, screen_name, screen_bytes)
+                    await self._send_photo_to_admins(
+                        screen_bytes,
+                        screen_name,
+                        f'🖼 <b>Планировщик:</b> экран по задаче <code>{job.job_id}</code>\n<code>{html.escape(screen_path.name)}</code>{note_block}',
+                    )
+                    self._record_runtime_activity('last_screenshot', 'планировщик отчет')
+
+                    try:
+                        webcam_bytes, webcam_name = await asyncio.to_thread(capture_webcam_photo)
+                    except Exception as exc:
+                        await self._notify_admins(
+                            f'❌ <b>Планировщик:</b> веб-камера недоступна для задачи <code>{job.job_id}</code>\n'
+                            f'<code>{html.escape(str(exc))}</code>{note_block}'
+                        )
+                    else:
+                        webcam_path = await asyncio.to_thread(self._save_artifact_bytes, webcam_name, webcam_bytes)
+                        await self._send_photo_to_admins(
+                            webcam_bytes,
+                            webcam_name,
+                            f'📸 <b>Планировщик:</b> веб-камера по задаче <code>{job.job_id}</code>\n<code>{html.escape(webcam_path.name)}</code>{note_block}',
+                        )
+                        self._record_runtime_activity('last_webcam', 'планировщик отчет')
+
+                    try:
+                        audio_bytes, audio_name = await asyncio.to_thread(record_audio, 5)
+                    except Exception as exc:
+                        await self._notify_admins(
+                            f'❌ <b>Планировщик:</b> микрофон недоступен для задачи <code>{job.job_id}</code>\n'
+                            f'<code>{html.escape(str(exc))}</code>{note_block}'
+                        )
+                    else:
+                        audio_path = await asyncio.to_thread(self._save_artifact_bytes, audio_name, audio_bytes)
+                        await self._send_audio_to_admins(
+                            audio_bytes,
+                            audio_name,
+                            f'🎙 <b>Планировщик:</b> окружение 5с по задаче <code>{job.job_id}</code>\n<code>{html.escape(audio_path.name)}</code>{note_block}',
+                        )
+                    continue
+
+                if action == 'music':
+                    music_text, thumb_bytes = await get_now_playing()
+                    caption = f'🎵 <b>Планировщик:</b> музыка по задаче <code>{job.job_id}</code>\n{music_text}{note_block}'
+                    if thumb_bytes:
+                        await self._send_photo_to_admins(thumb_bytes, 'cover.jpg', caption)
+                    else:
+                        await self._notify_admins(caption)
+                    continue
+
+                if action in {'playpause', 'nexttrack', 'prevtrack'}:
+                    from .input_actions import press_media_key
+
+                    key_code = {
+                        'playpause': 0xB3,
+                        'nexttrack': 0xB0,
+                        'prevtrack': 0xB1,
+                    }[action]
+                    await asyncio.to_thread(press_media_key, key_code)
+                    continue
+
                 if action == 'webcam':
                     photo_bytes, file_name = await asyncio.to_thread(capture_webcam_photo)
                     saved_path = await asyncio.to_thread(self._save_artifact_bytes, file_name, photo_bytes)
@@ -3212,6 +3406,7 @@ class TelegramBotService(QObject):
                         file_name,
                         f'📸 <b>Планировщик:</b> фото с вебки по задаче <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
                     )
+                    self._record_runtime_activity('last_webcam', 'планировщик фото')
                     continue
 
                 if action == 'webcamvid':
@@ -3223,6 +3418,7 @@ class TelegramBotService(QObject):
                         file_name,
                         f'🎥 <b>Планировщик:</b> видео с вебки {duration}с по задаче <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
                     )
+                    self._record_runtime_activity('last_webcam', f'планировщик видео {duration}с')
                     continue
 
                 if action == 'audio':
@@ -3234,6 +3430,23 @@ class TelegramBotService(QObject):
                         file_name,
                         f'🎙 <b>Планировщик:</b> аудио {duration}с по задаче <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
                     )
+                    continue
+
+                if action == 'cancelshutdown':
+                    cancelled_hibernate = False
+                    if self._hibernate_task and not self._hibernate_task.done():
+                        self._hibernate_task.cancel()
+                        self._hibernate_task = None
+                        cancelled_hibernate = True
+
+                    result = await asyncio.to_thread(cancel_scheduled_power_action)
+                    if result.code == 'not_pending':
+                        message = 'Таймер гибернации отменён.' if cancelled_hibernate else 'Нечего отменять: отложенное выключение или ребут не были запланированы.'
+                    elif cancelled_hibernate:
+                        message = 'Отложенное выключение/ребут и таймер гибернации отменены.'
+                    else:
+                        message = result.message
+                    self.log_message.emit(message)
                     continue
 
                 if action == 'lock':
@@ -3260,6 +3473,7 @@ class TelegramBotService(QObject):
                     return
         except Exception:
             error_text = f'❌ <b>Планировщик:</b> задача <code>{job.job_id}</code> завершилась ошибкой.{note_block}'
+            self._record_runtime_error(error_text)
             await self._edit_messages_for_admins(status_refs, error_text, reply_markup=self._dismiss_markup())
             raise
 
@@ -3528,6 +3742,98 @@ class TelegramBotService(QObject):
                 self.log_message.emit(f'Failed to notify admin {admin_id} about motion: {exc}')
         await self._refresh_media_menus()
 
+    async def _try_handle_extended_voice_command(
+            self,
+            update: Update,
+            context: ContextTypes.DEFAULT_TYPE,
+            text: str,
+    ) -> bool:
+        cleaned = ' '.join(str(text or '').lower().replace('ё', 'е').split())
+
+        def has_any(*phrases: str) -> bool:
+            return any(phrase in cleaned for phrase in phrases)
+
+        def tail_after(*markers: str) -> str:
+            for marker in markers:
+                marker_clean = ' '.join(str(marker).lower().replace('ё', 'е').split())
+                if cleaned == marker_clean:
+                    return ''
+                if cleaned.startswith(marker_clean + ' '):
+                    return cleaned[len(marker_clean):].strip(' ,.:;!?')
+                index = cleaned.find(marker_clean)
+                if index >= 0:
+                    return cleaned[index + len(marker_clean):].strip(' ,.:;!?')
+            return ''
+
+        ocr_query = tail_after('найди на экране', 'ищи на экране', 'поиск на экране')
+        if ocr_query:
+            await self._command_ocr(update, self._clone_context_with_args(context, ocr_query.split()))
+            return True
+
+        if has_any('прочитай экран', 'распознай экран', 'ocr экран', 'сделай ocr', 'сделай окр', 'ocr'):
+            await self._command_ocr(update, self._clone_context_with_args(context, []))
+            return True
+
+        clipboard_text = tail_after('скопируй в буфер', 'запиши в буфер', 'установи буфер', 'положи в буфер')
+        if clipboard_text:
+            await self._command_clip(update, self._clone_context_with_args(context, clipboard_text.split()))
+            return True
+
+        if has_any('история буфера', 'историю буфера'):
+            await self._command_clip_history(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('буфер обмена', 'покажи буфер', 'что в буфере'):
+            await self._command_clip(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('живые окна', 'список окон', 'покажи окна', 'активные окна'):
+            await self._command_windows(update, self._clone_context_with_args(context, []))
+            return True
+
+        process_filter = ''
+        if cleaned == 'процессы' or cleaned == 'тасклист':
+            process_filter = ''
+        elif cleaned.startswith('процессы '):
+            process_filter = cleaned[len('процессы '):].strip()
+        elif cleaned.startswith('тасклист '):
+            process_filter = cleaned[len('тасклист '):].strip()
+        elif has_any('список процессов', 'покажи процессы'):
+            process_filter = tail_after('список процессов', 'покажи процессы')
+        if cleaned in {'процессы', 'тасклист'} or has_any('список процессов', 'покажи процессы') or cleaned.startswith('процессы ') or cleaned.startswith('тасклист '):
+            args = process_filter.split() if process_filter else []
+            await self._command_tasklist(update, self._clone_context_with_args(context, args))
+            return True
+
+        if has_any('железо', 'датчики', 'температуры', 'температура'):
+            await self._command_hw(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('аптайм', 'время работы', 'сколько работает'):
+            await self._command_uptime(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('пинг', 'проверь связь', 'есть связь'):
+            await self._command_ping(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('отмени выключение', 'отмена выключения', 'отмени перезагрузку', 'отмена перезагрузки'):
+            await self._command_cancel_shutdown(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('анти афк', 'anti afk', 'antiafk'):
+            if has_any('выключи', 'выруби', 'стоп', 'останови'):
+                await self._command_antiafk_off(update, self._clone_context_with_args(context, []))
+            else:
+                await self._command_antiafk_on(update, self._clone_context_with_args(context, []))
+            return True
+
+        if has_any('задачи планировщика', 'список задач', 'покажи задачи', 'планировщик задачи'):
+            await self._command_jobs(update, self._clone_context_with_args(context, []))
+            return True
+
+        return False
+
     async def _handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
         if not await self._ensure_admin(update): return
@@ -3562,6 +3868,9 @@ class TelegramBotService(QObject):
             await status_msg.edit_text(f"🗣 <b>Голос:</b> <i>{text}</i>", parse_mode=ParseMode.HTML, reply_markup=self._dismiss_markup())
 
             # --- Умный парсинг всех команд ---
+            if await self._try_handle_extended_voice_command(update, context, text):
+                return
+
             if "таймер" in text:
                 import re
                 match = re.search(r'(\d+)\s*(мин|час|сек)', text)
@@ -4326,6 +4635,7 @@ class TelegramBotService(QObject):
                         read_timeout=60,
                         write_timeout=60,
                     )
+                self._record_runtime_activity('last_screenshot', 'окно')
                 await query.answer('Скрин окна отправлен.', show_alert=False)
                 text = await asyncio.to_thread(self._window_detail_text, hwnd)
                 markup = self._window_detail_markup(hwnd, page)
@@ -5071,6 +5381,7 @@ class TelegramBotService(QObject):
                                dismissable=True, as_toast=True)
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self._record_runtime_error(str(context.error))
         self.log_message.emit(f'Unhandled bot error: {context.error}')
         if isinstance(update, Update):
             await self._safe_reply(update, f'❌ Внутренняя ошибка бота:\n<code>{html.escape(str(context.error))}</code>',
@@ -5167,6 +5478,7 @@ class TelegramBotService(QObject):
                     break
                 self.log_message.emit('🔄 Перезапуск сетевой сессии...')
             except Exception as exc:
+                self._record_runtime_error(f'Ошибка сети: {exc}')
                 self.log_message.emit(f'⚠️ Ошибка сети: {exc}. Повтор через 5 сек...')
 
             self._running = False
@@ -5272,6 +5584,7 @@ class TelegramBotService(QObject):
 
         self._running = True
         self.state_changed.emit(True)
+        self._update_runtime_metrics(last_successful_reconnect=time.time())
         self.log_message.emit('Bot started successfully.')
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
@@ -5335,6 +5648,7 @@ class TelegramBotService(QObject):
                         network_fails += 1
 
                     if network_fails >= 3:  # 15 секунд сеть мертва
+                        self._record_runtime_error('Смена VPN или обрыв интернета. Принудительный рестарт сетевой сессии.')
                         self.log_message.emit('🌐 Смена VPN или обрыв интернета! Принудительный рестарт...')
                         break
         finally:

@@ -13,3 +13,4 @@ old_main_legacy.py
 *.spec.backup
 old/
 
+/tmp_ocr_ru.png

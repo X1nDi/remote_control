@@ -1,7 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-datas = []
+datas = [
+    ('pc_controller/icon.png', 'pc_controller'),
+    ('pc_controller/app_icon.ico', 'pc_controller'),
+]
 binaries = []
 hiddenimports = collect_submodules('winsdk')
 
@@ -40,4 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='pc_controller/app_icon.ico',
 )

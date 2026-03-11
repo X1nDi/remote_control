@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
+import time
+from datetime import datetime
 from os import startfile
 from pathlib import Path
 
 from PySide6.QtCore import Property, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QRect, QSize, Qt, \
     QTimer, QPoint
-from PySide6.QtGui import QAction, QPainter, QColor, QPainterPath, QPen
+from PySide6.QtGui import QAction, QPainter, QColor, QPainterPath, QPen, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -120,6 +124,11 @@ QFrame#MiniStatCard {
     border: 1px solid rgba(51, 65, 85, 0.4);
     border-radius: 12px;
 }
+QFrame#StatusStripCard {
+    background: rgba(15, 23, 42, 0.45);
+    border: 1px solid rgba(51, 65, 85, 0.35);
+    border-radius: 14px;
+}
 QLabel#MiniStatValue {
     font-size: 22px;
     font-weight: bold;
@@ -128,6 +137,23 @@ QLabel#MiniStatValue {
 QLabel#MiniStatCaption {
     color: #64748b;
     font-size: 12px;
+}
+QLabel#StatusKey {
+    color: #93c5fd;
+    font-size: 12px;
+    font-weight: bold;
+}
+QLabel#StatusValue {
+    color: #ffffff;
+    font-size: 14px;
+}
+QLabel#StepDone {
+    color: #bbf7d0;
+    font-weight: bold;
+}
+QLabel#StepTodo {
+    color: #fcd34d;
+    font-weight: bold;
 }
 QLineEdit, QPlainTextEdit {
     background: rgba(15, 23, 42, 0.8);
@@ -246,6 +272,32 @@ QListWidget::item:hover:!selected {
 }
 """
 
+PERMISSION_FIELDS: list[tuple[str, str]] = [
+    ('power', 'Питание'),
+    ('open_url', 'Ссылки'),
+    ('files', 'Файлы'),
+    ('process', 'Процессы'),
+    ('input', 'Ввод'),
+    ('media', 'Медиа'),
+]
+
+
+def _asset_base_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        bundle_root = getattr(sys, '_MEIPASS', '')
+        if bundle_root:
+            bundled_dir = Path(bundle_root) / 'pc_controller'
+            if bundled_dir.exists():
+                return bundled_dir
+    return Path(__file__).resolve().parent
+
+
+def _load_app_icon() -> QIcon:
+    icon_path = _asset_base_dir() / 'icon.png'
+    if icon_path.exists():
+        return QIcon(str(icon_path))
+    return QIcon()
+
 
 class ToastWidget(QWidget):
     """Красивое всплывающее уведомление (Toast) внутри окна"""
@@ -358,6 +410,9 @@ class InstallDialog(QDialog):
         self.setModal(True)
         self.setFixedSize(560, 270)
         self.setStyleSheet(APP_STYLE)
+        app_icon = _load_app_icon()
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
 
         self.action = "leave"
         self.chosen_path = APP_DIR / ("PCController.exe" if getattr(sys, 'frozen', False) else "PCController.py")
@@ -457,6 +512,13 @@ class MainWindow(QMainWindow):
         self._intro_group: QParallelAnimationGroup | None = None
         self._tab_fade_animation: QPropertyAnimation | None = None
         self._current_admins_data: dict[str, AdminPerms] = {}
+        self._matrix_checkboxes: dict[tuple[str, str], QCheckBox] = {}
+        self._log_records: list[dict[str, object]] = []
+        self._last_logged_error_time: float | None = None
+        self._last_logged_error_message: str | None = None
+        self._loading_config = False
+        self._config_dirty = False
+        self._last_saved_at = self.config_manager.path.stat().st_mtime if self.config_manager.path.exists() else None
 
         self.setWindowTitle('PC Controller')
         self.resize(1240, 860)
@@ -464,6 +526,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(APP_STYLE)
 
         self._build_ui()
+        self._setup_status_bar()
         self._setup_tray()
         self._connect_signals()
 
@@ -472,6 +535,7 @@ class MainWindow(QMainWindow):
         self.logger.addHandler(self.log_handler)
 
         self._load_config_into_form()
+        self._start_live_ui_updates()
 
         if self._config.auto_start_bot:
             QTimer.singleShot(600, lambda: self.start_bot(save_before_start=False))
@@ -543,11 +607,19 @@ class MainWindow(QMainWindow):
         self.hero.setGraphicsEffect(self._hero_effect)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_settings_tab(), 'Настройки')
-        self.tabs.addTab(self._build_permissions_card(), 'Администраторы')
-        self.tabs.addTab(self._build_commands_tab(), 'Telegram')
-        self.tabs.addTab(self._build_logs_tab(), 'Логи')
-        self.tabs.addTab(self._build_about_tab(), 'О программе')
+        self.dashboard_tab = self._build_dashboard_tab()
+        self.settings_tab = self._build_settings_tab()
+        self.permissions_tab = self._build_permissions_card()
+        self.telegram_tab = self._build_commands_tab()
+        self.logs_tab = self._build_logs_tab()
+        self.about_tab = self._build_about_tab()
+
+        self.tabs.addTab(self.dashboard_tab, 'Дашборд')
+        self.tabs.addTab(self.settings_tab, 'Настройки')
+        self.tabs.addTab(self.permissions_tab, 'Администраторы')
+        self.tabs.addTab(self.telegram_tab, 'Telegram')
+        self.tabs.addTab(self.logs_tab, 'Логи')
+        self.tabs.addTab(self.about_tab, 'О программе')
 
         self._tabs_effect = QGraphicsOpacityEffect(self.tabs)
         self._tabs_effect.setOpacity(0.0)
@@ -556,6 +628,104 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.hero)
         main_layout.addWidget(self.tabs, stretch=1)
         self.setCentralWidget(root)
+
+    def _build_dashboard_tab(self) -> QWidget:
+        wrapper = QWidget()
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(16)
+
+        self.onboarding_card = QGroupBox('Быстрый старт')
+        onboarding_layout = QVBoxLayout(self.onboarding_card)
+        onboarding_layout.setSpacing(10)
+        self.onboarding_summary_label = QLabel()
+        self.onboarding_summary_label.setWordWrap(True)
+        self.onboarding_summary_label.setObjectName('Muted')
+        onboarding_layout.addWidget(self.onboarding_summary_label)
+
+        self.onboarding_step_labels: list[QLabel] = []
+        for _ in range(4):
+            label = QLabel()
+            label.setWordWrap(True)
+            onboarding_layout.addWidget(label)
+            self.onboarding_step_labels.append(label)
+
+        onboarding_buttons = QHBoxLayout()
+        self.onboarding_settings_button = QPushButton('⚙ Настройки')
+        self.onboarding_settings_button.setProperty('secondary', 'true')
+        self.onboarding_admins_button = QPushButton('👥 Админы')
+        self.onboarding_admins_button.setProperty('secondary', 'true')
+        self.onboarding_start_button = QPushButton('▶ Запустить бота')
+        self.onboarding_panel_button = QPushButton('🎛 Скопировать /panel')
+        self.onboarding_panel_button.setProperty('secondary', 'true')
+        onboarding_buttons.addWidget(self.onboarding_settings_button)
+        onboarding_buttons.addWidget(self.onboarding_admins_button)
+        onboarding_buttons.addWidget(self.onboarding_start_button)
+        onboarding_buttons.addWidget(self.onboarding_panel_button)
+        onboarding_buttons.addStretch(1)
+        onboarding_layout.addLayout(onboarding_buttons)
+        layout.addWidget(self.onboarding_card)
+
+        overview_card = QGroupBox('Сводка')
+        overview_layout = QVBoxLayout(overview_card)
+        overview_layout.setSpacing(14)
+
+        stats_grid = QGridLayout()
+        stats_grid.setHorizontalSpacing(12)
+        stats_grid.setVerticalSpacing(12)
+        self.dashboard_bot_card, self.dashboard_bot_value = self._create_stat_card('Бот', 'OFF')
+        self.dashboard_scheduler_card, self.dashboard_scheduler_value = self._create_stat_card('Задач', '0')
+        self.dashboard_admins_card, self.dashboard_admins_value = self._create_stat_card('Админов', '0')
+        self.dashboard_ping_card, self.dashboard_ping_value = self._create_stat_card('Последний ping', '—')
+        stats_grid.addWidget(self.dashboard_bot_card, 0, 0)
+        stats_grid.addWidget(self.dashboard_scheduler_card, 0, 1)
+        stats_grid.addWidget(self.dashboard_admins_card, 1, 0)
+        stats_grid.addWidget(self.dashboard_ping_card, 1, 1)
+        overview_layout.addLayout(stats_grid)
+
+        activity_card = QFrame()
+        activity_card.setObjectName('StatusStripCard')
+        activity_layout = QGridLayout(activity_card)
+        activity_layout.setContentsMargins(16, 16, 16, 16)
+        activity_layout.setHorizontalSpacing(24)
+        activity_layout.setVerticalSpacing(10)
+        self.dashboard_last_reconnect_value = self._create_status_value()
+        self.dashboard_last_screenshot_value = self._create_status_value()
+        self.dashboard_last_webcam_value = self._create_status_value()
+        self.dashboard_last_ocr_value = self._create_status_value()
+        self.dashboard_last_error_value = self._create_status_value()
+        self.dashboard_last_error_value.setWordWrap(True)
+        self._add_status_row(activity_layout, 0, 0, 'Последний reconnect', self.dashboard_last_reconnect_value)
+        self._add_status_row(activity_layout, 1, 0, 'Последний скрин', self.dashboard_last_screenshot_value)
+        self._add_status_row(activity_layout, 2, 0, 'Последняя вебка', self.dashboard_last_webcam_value)
+        self._add_status_row(activity_layout, 0, 2, 'Последний OCR', self.dashboard_last_ocr_value)
+        self._add_status_row(activity_layout, 1, 2, 'Последняя ошибка', self.dashboard_last_error_value)
+        overview_layout.addWidget(activity_card)
+
+        quick_actions = QHBoxLayout()
+        self.dashboard_refresh_button = QPushButton('🔄 Обновить')
+        self.dashboard_refresh_button.setProperty('secondary', 'true')
+        self.dashboard_logs_button = QPushButton('🧾 Открыть логи')
+        self.dashboard_logs_button.setProperty('secondary', 'true')
+        self.dashboard_copy_panel_button = QPushButton('🎛 Скопировать /panel')
+        self.dashboard_copy_panel_button.setProperty('secondary', 'true')
+        quick_actions.addWidget(self.dashboard_refresh_button)
+        quick_actions.addWidget(self.dashboard_logs_button)
+        quick_actions.addWidget(self.dashboard_copy_panel_button)
+        quick_actions.addStretch(1)
+        overview_layout.addLayout(quick_actions)
+        layout.addWidget(overview_card)
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        return wrapper
 
     def _build_settings_tab(self) -> QWidget:
         wrapper = QWidget()
@@ -690,34 +860,20 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.admins_list)
         left_layout.addLayout(btn_layout)
 
-        self.perms_widget = QWidget()
+        self.perms_widget = QGroupBox('Матрица прав')
         perms_layout = QVBoxLayout(self.perms_widget)
-        perms_layout.setSpacing(16)
+        perms_layout.setSpacing(12)
+        perms_layout.addWidget(QLabel('Все права видны сразу. Можно быстро включать и выключать доступ по колонкам админов.'))
 
-        self.perm_power = AnimatedToggle('🔋 Питание (выключение, ребут, сон, лок)')
-        self.perm_open_url = AnimatedToggle('🌐 Открытие ссылок (/openurl)')
-        self.perm_files = AnimatedToggle('🗂 Файлы (перемещение, загрузка, скачивание)')
-        self.perm_process = AnimatedToggle('⚙️ Процессы (просмотр и завершение taskkill)')
-        self.perm_input = AnimatedToggle('⌨️ Ввод (мышь, текст, клавиши, AutoAccept)')
-        self.perm_media = AnimatedToggle('🎥 Медиа (камера, аудио, скриншоты)')
-
-        self.perm_power.toggled.connect(lambda: self._update_current_admin_perm('power'))
-        self.perm_open_url.toggled.connect(lambda: self._update_current_admin_perm('open_url'))
-        self.perm_files.toggled.connect(lambda: self._update_current_admin_perm('files'))
-        self.perm_process.toggled.connect(lambda: self._update_current_admin_perm('process'))
-        self.perm_input.toggled.connect(lambda: self._update_current_admin_perm('input'))
-        self.perm_media.toggled.connect(lambda: self._update_current_admin_perm('media'))
-
-        perms_layout.addWidget(QLabel('<b>Индивидуальные права для выбранного админа:</b>'))
-        perms_layout.addWidget(self.perm_power)
-        perms_layout.addWidget(self.perm_open_url)
-        perms_layout.addWidget(self.perm_files)
-        perms_layout.addWidget(self.perm_process)
-        perms_layout.addWidget(self.perm_input)
-        perms_layout.addWidget(self.perm_media)
-        perms_layout.addStretch()
-
-        self.perms_widget.setEnabled(False)
+        self.perms_matrix_scroll = QScrollArea()
+        self.perms_matrix_scroll.setWidgetResizable(True)
+        self.perms_matrix_content = QWidget()
+        self.perms_matrix_layout = QGridLayout(self.perms_matrix_content)
+        self.perms_matrix_layout.setContentsMargins(4, 4, 4, 4)
+        self.perms_matrix_layout.setHorizontalSpacing(12)
+        self.perms_matrix_layout.setVerticalSpacing(10)
+        self.perms_matrix_scroll.setWidget(self.perms_matrix_content)
+        perms_layout.addWidget(self.perms_matrix_scroll, stretch=1)
 
         layout.addLayout(left_layout)
         layout.addWidget(self.perms_widget, stretch=1)
@@ -748,8 +904,11 @@ class MainWindow(QMainWindow):
         self.open_logs_button.setProperty('secondary', 'true')
         self.show_config_button = QPushButton('🧩 Открыть папку конфига')
         self.show_config_button.setProperty('secondary', 'true')
+        self.install_app_button = QPushButton('📦 Установить приложение...')
+        self.install_app_button.setProperty('secondary', 'true')
         buttons.addWidget(self.open_logs_button)
         buttons.addWidget(self.show_config_button)
+        buttons.addWidget(self.install_app_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         return card
@@ -786,6 +945,21 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setSpacing(10)
 
+        filters = QHBoxLayout()
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(['Все', 'INFO', 'WARNING', 'ERROR'])
+        self.log_search_edit = QLineEdit()
+        self.log_search_edit.setPlaceholderText('Поиск по строкам логов...')
+        self.log_errors_today_button = QPushButton('⛔ Только ошибки за сегодня')
+        self.log_errors_today_button.setProperty('secondary', 'true')
+        self.log_errors_today_button.setCheckable(True)
+        self.log_pause_autoscroll_checkbox = QCheckBox('Пауза автоскролла')
+        filters.addWidget(QLabel('Уровень'))
+        filters.addWidget(self.log_level_combo)
+        filters.addWidget(self.log_search_edit, stretch=1)
+        filters.addWidget(self.log_errors_today_button)
+        filters.addWidget(self.log_pause_autoscroll_checkbox)
+
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
 
@@ -794,10 +968,14 @@ class MainWindow(QMainWindow):
         self.clear_log_view_button.setProperty('secondary', 'true')
         self.refresh_log_view_button = QPushButton('🔁 Загрузить последние 200 строк')
         self.refresh_log_view_button.setProperty('secondary', 'true')
+        self.copy_log_selection_button = QPushButton('📋 Копировать выделенное')
+        self.copy_log_selection_button.setProperty('secondary', 'true')
         controls.addWidget(self.clear_log_view_button)
         controls.addWidget(self.refresh_log_view_button)
+        controls.addWidget(self.copy_log_selection_button)
         controls.addStretch(1)
 
+        layout.addLayout(filters)
         layout.addWidget(self.log_output, stretch=1)
         layout.addLayout(controls)
         return tab
@@ -840,6 +1018,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(caption_label)
         return card, value_label
 
+    @staticmethod
+    def _create_status_value() -> QLabel:
+        label = QLabel('—')
+        label.setObjectName('StatusValue')
+        label.setWordWrap(True)
+        return label
+
+    def _add_status_row(self, layout: QGridLayout, row: int, column: int, title: str, value_label: QLabel) -> None:
+        key = QLabel(title)
+        key.setObjectName('StatusKey')
+        layout.addWidget(key, row, column)
+        layout.addWidget(value_label, row, column + 1)
+
     def _make_path_label(self) -> QLabel:
         label = QLabel('')
         label.setObjectName('PathValue')
@@ -849,7 +1040,10 @@ class MainWindow(QMainWindow):
 
     def _setup_tray(self) -> None:
         app = QApplication.instance()
-        icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        icon = _load_app_icon()
+        if icon.isNull():
+            icon = app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        app.setWindowIcon(icon)
         self.setWindowIcon(icon)
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip('PC Controller')
@@ -876,6 +1070,37 @@ class MainWindow(QMainWindow):
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
 
+    def _setup_status_bar(self) -> None:
+        status = self.statusBar()
+        status.setSizeGripEnabled(False)
+
+        self.status_bot_label = QLabel()
+        self.status_autostart_label = QLabel()
+        self.status_config_label = QLabel()
+        self.status_last_save_label = QLabel()
+        self.status_log_lines_label = QLabel()
+        self.status_scheduler_label = QLabel()
+
+        for label in (
+            self.status_bot_label,
+            self.status_autostart_label,
+            self.status_config_label,
+            self.status_last_save_label,
+            self.status_log_lines_label,
+            self.status_scheduler_label,
+        ):
+            label.setObjectName('Muted')
+            status.addPermanentWidget(label)
+
+        self._refresh_status_bar()
+
+    def _start_live_ui_updates(self) -> None:
+        self._live_ui_timer = QTimer(self)
+        self._live_ui_timer.setInterval(1000)
+        self._live_ui_timer.timeout.connect(self._refresh_live_panels)
+        self._live_ui_timer.start()
+        self._refresh_live_panels()
+
     def _connect_signals(self) -> None:
         self.save_button.clicked.connect(self.save_settings)
         self.toggle_bot_button.clicked.connect(self._on_toggle_bot_clicked)
@@ -886,13 +1111,250 @@ class MainWindow(QMainWindow):
         self.bot_panel_hint_button.clicked.connect(self.copy_panel_to_clipboard)
         self.open_logs_button.clicked.connect(self.open_logs_folder)
         self.show_config_button.clicked.connect(self.open_config_folder)
-        self.clear_log_view_button.clicked.connect(self.log_output.clear)
+        self.install_app_button.clicked.connect(self.open_install_dialog)
+        self.clear_log_view_button.clicked.connect(self._clear_log_view)
         self.refresh_log_view_button.clicked.connect(self.load_last_log_lines)
+        self.copy_log_selection_button.clicked.connect(self._copy_selected_logs)
         self.quit_button.clicked.connect(self.quit_app)
         self.tabs.currentChanged.connect(self._animate_current_tab)
+        self.log_level_combo.currentTextChanged.connect(self._render_logs)
+        self.log_search_edit.textChanged.connect(self._render_logs)
+        self.log_errors_today_button.toggled.connect(self._render_logs)
+        self.dashboard_refresh_button.clicked.connect(self._refresh_live_panels)
+        self.dashboard_logs_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.logs_tab))
+        self.dashboard_copy_panel_button.clicked.connect(self.copy_panel_to_clipboard)
+        self.onboarding_settings_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.settings_tab))
+        self.onboarding_admins_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.permissions_tab))
+        self.onboarding_start_button.clicked.connect(self._on_toggle_bot_clicked)
+        self.onboarding_panel_button.clicked.connect(self.copy_panel_to_clipboard)
 
         self.bot_service.log_message.connect(self.append_log)
         self.bot_service.state_changed.connect(self.on_bot_state_changed)
+
+    def _refresh_live_panels(self, *_args) -> None:
+        self._refresh_dashboard()
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        runtime = self.bot_service.get_runtime_snapshot()
+        bot_text = 'Bot ON' if runtime.get('running') else 'Bot OFF'
+        autostart_text = 'Autostart ON' if self.autostart_checkbox.isChecked() else 'Autostart OFF' if hasattr(self, 'autostart_checkbox') else 'Autostart ?'
+        config_text = 'Config saved' if not self._config_dirty else 'Config pending'
+        last_save_text = f'Last save {self._format_timestamp(self._last_saved_at)}' if self._last_saved_at else 'Last save —'
+        self.status_bot_label.setText(bot_text)
+        self.status_autostart_label.setText(autostart_text)
+        self.status_config_label.setText(config_text)
+        self.status_last_save_label.setText(last_save_text)
+        self.status_log_lines_label.setText(f'Log lines {len(self._log_records)}')
+        self.status_scheduler_label.setText(f'Scheduler {runtime.get("scheduler_jobs", 0)} jobs')
+
+    def _refresh_dashboard(self) -> None:
+        runtime = self.bot_service.get_runtime_snapshot()
+        self.dashboard_bot_value.setText('ON' if runtime.get('running') else 'OFF')
+        self.dashboard_scheduler_value.setText(str(runtime.get('scheduler_jobs', 0)))
+        self.dashboard_admins_value.setText(str(len(self._current_admins_data)))
+        self.dashboard_ping_value.setText(self._format_timestamp(runtime.get('last_ping')))
+        self.dashboard_last_reconnect_value.setText(self._format_timestamp(runtime.get('last_successful_reconnect')))
+        self.dashboard_last_screenshot_value.setText(
+            self._format_event(runtime.get('last_screenshot'), runtime.get('last_screenshot_detail'))
+        )
+        self.dashboard_last_webcam_value.setText(
+            self._format_event(runtime.get('last_webcam'), runtime.get('last_webcam_detail'))
+        )
+        self.dashboard_last_ocr_value.setText(
+            self._format_event(runtime.get('last_ocr'), runtime.get('last_ocr_detail'))
+        )
+
+        runtime_error_ts = runtime.get('last_error_time')
+        runtime_error_msg = runtime.get('last_error_message')
+        if self._last_logged_error_time and (
+            runtime_error_ts is None or self._last_logged_error_time > float(runtime_error_ts)
+        ):
+            self.dashboard_last_error_value.setText(self._format_event(self._last_logged_error_time, self._last_logged_error_message))
+        else:
+            self.dashboard_last_error_value.setText(self._format_event(runtime_error_ts, runtime_error_msg))
+
+        self._update_onboarding_card()
+
+    def _update_onboarding_card(self) -> None:
+        token_ready = bool(self.token_edit.text().strip()) if hasattr(self, 'token_edit') else False
+        admins_ready = bool(self._current_admins_data)
+        bot_ready = self.bot_service.running
+        panel_ready = bot_ready
+        steps = [
+            (token_ready, '1. Вставьте токен бота в Настройках.'),
+            (admins_ready, '2. Добавьте свой Telegram ID в Администраторы.'),
+            (bot_ready, '3. Запустите бота из приложения.'),
+            (panel_ready, '4. Отправьте в Telegram команду /panel.'),
+        ]
+        pending_count = sum(0 if done else 1 for done, _ in steps)
+        if pending_count == 0:
+            self.onboarding_summary_label.setText('Базовая настройка завершена. Панель готова к работе.')
+        else:
+            self.onboarding_summary_label.setText(f'Осталось шагов: {pending_count}. Идите сверху вниз, без лишней возни.')
+
+        for label, (done, text) in zip(self.onboarding_step_labels, steps):
+            label.setObjectName('StepDone' if done else 'StepTodo')
+            prefix = '✓' if done else '•'
+            label.setText(f'{prefix} {text}')
+            label.style().unpolish(label)
+            label.style().polish(label)
+        self.onboarding_card.setVisible(pending_count > 0)
+
+    @staticmethod
+    def _format_timestamp(raw_ts: object) -> str:
+        if raw_ts in (None, '', 0):
+            return '—'
+        try:
+            value = float(raw_ts)
+        except (TypeError, ValueError):
+            return str(raw_ts)
+        stamp = datetime.fromtimestamp(value)
+        now = datetime.now()
+        if stamp.date() == now.date():
+            return stamp.strftime('%H:%M:%S')
+        return stamp.strftime('%d.%m %H:%M')
+
+    def _format_event(self, raw_ts: object, detail: object) -> str:
+        base = self._format_timestamp(raw_ts)
+        if base == '—':
+            return base
+        detail_text = str(detail).strip() if detail else ''
+        return f'{base} ({detail_text})' if detail_text else base
+
+    def _set_config_dirty(self, dirty: bool) -> None:
+        self._config_dirty = dirty
+        self._refresh_status_bar()
+
+    @staticmethod
+    def _detect_log_level(line: str) -> str:
+        upper_line = line.upper()
+        lower_line = line.lower()
+        if '| ERROR |' in upper_line or '❌' in line or 'ошиб' in lower_line or 'failed' in lower_line:
+            return 'ERROR'
+        if '| WARNING |' in upper_line or '⚠' in line or 'warning' in lower_line or 'warn' in lower_line:
+            return 'WARNING'
+        return 'INFO'
+
+    def _make_log_record(self, line: str) -> dict[str, object]:
+        text = str(line or '').rstrip()
+        ts = time.time()
+        rendered_text = text
+        match = re.match(r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?) \| (?P<level>[A-Z]+) \| (?P<msg>.*)$', text)
+        if match:
+            raw_ts = match.group('ts')
+            level = match.group('level').upper()
+            try:
+                ts = datetime.strptime(raw_ts, '%Y-%m-%d %H:%M:%S,%f').timestamp()
+            except ValueError:
+                try:
+                    ts = datetime.strptime(raw_ts, '%Y-%m-%d %H:%M:%S').timestamp()
+                except ValueError:
+                    ts = time.time()
+        else:
+            level = self._detect_log_level(text)
+            rendered_text = f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | {level} | {text}'
+        return {
+            'ts': ts,
+            'dt': datetime.fromtimestamp(ts),
+            'level': level,
+            'text': rendered_text,
+            'raw': text,
+        }
+
+    def _filtered_log_records(self) -> list[dict[str, object]]:
+        search = self.log_search_edit.text().strip().lower() if hasattr(self, 'log_search_edit') else ''
+        selected_level = self.log_level_combo.currentText() if hasattr(self, 'log_level_combo') else 'Все'
+        only_errors_today = self.log_errors_today_button.isChecked() if hasattr(self, 'log_errors_today_button') else False
+        today = datetime.now().date()
+
+        result: list[dict[str, object]] = []
+        for record in self._log_records:
+            level = str(record['level'])
+            text = str(record['text'])
+            dt = record['dt']
+            if selected_level != 'Все' and level != selected_level:
+                continue
+            if only_errors_today and (level != 'ERROR' or getattr(dt, 'date', lambda: None)() != today):
+                continue
+            if search and search not in text.lower():
+                continue
+            result.append(record)
+        return result
+
+    def _render_logs(self, *_args) -> None:
+        if not hasattr(self, 'log_output'):
+            return
+        filtered = self._filtered_log_records()
+        text = '\n'.join(str(record['text']) for record in filtered).strip()
+        self.log_output.setPlainText(text or 'Нет записей для текущего фильтра.')
+        if not self.log_pause_autoscroll_checkbox.isChecked():
+            scroll = self.log_output.verticalScrollBar()
+            scroll.setValue(scroll.maximum())
+        self._refresh_status_bar()
+
+    def _clear_log_view(self, *_args) -> None:
+        self._log_records.clear()
+        self.log_output.clear()
+        self._refresh_status_bar()
+
+    def _copy_selected_logs(self, *_args) -> None:
+        cursor = self.log_output.textCursor()
+        selected = cursor.selectedText().replace('\u2029', '\n').strip()
+        if not selected:
+            selected = self.log_output.toPlainText().strip()
+        if selected:
+            QApplication.clipboard().setText(selected)
+            self.show_toast('📋 Логи скопированы')
+
+    def _rebuild_permissions_matrix(self) -> None:
+        if not hasattr(self, 'perms_matrix_layout'):
+            return
+
+        self._matrix_checkboxes.clear()
+        while self.perms_matrix_layout.count():
+            item = self.perms_matrix_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        admins = list(self._current_admins_data.keys())
+        if not admins:
+            empty = QLabel('Сначала добавьте хотя бы один Telegram ID. Потом матрица прав заполнится автоматически.')
+            empty.setObjectName('Muted')
+            empty.setWordWrap(True)
+            self.perms_matrix_layout.addWidget(empty, 0, 0)
+            return
+
+        header = QLabel('Право')
+        header.setObjectName('SectionTitle')
+        self.perms_matrix_layout.addWidget(header, 0, 0)
+        for col, admin_id in enumerate(admins, start=1):
+            label = QLabel(admin_id)
+            label.setObjectName('SectionTitle')
+            label.setWordWrap(True)
+            self.perms_matrix_layout.addWidget(label, 0, col)
+
+        for row, (field_name, title) in enumerate(PERMISSION_FIELDS, start=1):
+            label = QLabel(title)
+            self.perms_matrix_layout.addWidget(label, row, 0)
+            for col, admin_id in enumerate(admins, start=1):
+                checkbox = QCheckBox()
+                checkbox.setChecked(getattr(self._current_admins_data[admin_id], field_name))
+                checkbox.stateChanged.connect(
+                    lambda _state, a=admin_id, f=field_name, box=checkbox: self._on_matrix_perm_changed(a, f, box.isChecked())
+                )
+                self._matrix_checkboxes[(admin_id, field_name)] = checkbox
+                self.perms_matrix_layout.addWidget(checkbox, row, col, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.perms_matrix_layout.setColumnStretch(len(admins) + 1, 1)
+
+    def _on_matrix_perm_changed(self, admin_id: str, field_name: str, checked: bool) -> None:
+        perms = self._current_admins_data.get(admin_id)
+        if perms is None:
+            return
+        setattr(perms, field_name, checked)
+        self._schedule_save()
 
     def _add_admin(self):
         text, ok = QInputDialog.getText(self, 'Добавить админа', 'Введите Telegram ID администратора:')
@@ -902,6 +1364,8 @@ class MainWindow(QMainWindow):
                 self._current_admins_data[admin_id] = AdminPerms()
                 self.admins_list.addItem(admin_id)
                 self.admins_list.setCurrentRow(self.admins_list.count() - 1)
+                self._rebuild_permissions_matrix()
+                self._refresh_state_cards()
                 self._schedule_save()
 
     def _remove_admin(self):
@@ -910,62 +1374,51 @@ class MainWindow(QMainWindow):
             admin_id = self.admins_list.item(row).text()
             del self._current_admins_data[admin_id]
             self.admins_list.takeItem(row)
+            self._rebuild_permissions_matrix()
+            self._refresh_state_cards()
             self._schedule_save()
 
     def _on_admin_selected(self):
-        items = self.admins_list.selectedItems()
-        if not items:
-            self.perms_widget.setEnabled(False)
-            return
-
-        self.perms_widget.setEnabled(True)
-        admin_id = items[0].text()
-        perms = self._current_admins_data[admin_id]
-
-        self.perm_power.set_checked_silent(perms.power)
-        self.perm_open_url.set_checked_silent(perms.open_url)
-        self.perm_files.set_checked_silent(perms.files)
-        self.perm_process.set_checked_silent(perms.process)
-        self.perm_input.set_checked_silent(perms.input)
-        self.perm_media.set_checked_silent(perms.media)
+        self._rebuild_permissions_matrix()
 
     def _update_current_admin_perm(self, field_name: str):
-        items = self.admins_list.selectedItems()
-        if not items:
-            return
-        admin_id = items[0].text()
-        perms = self._current_admins_data[admin_id]
-        val = getattr(self, f"perm_{field_name}").isChecked()
-        setattr(perms, field_name, val)
-        self._schedule_save()
+        self._rebuild_permissions_matrix()
 
     def _load_config_into_form(self) -> None:
-        self.token_edit.setText(self._config.bot_token)
+        self._loading_config = True
+        try:
+            self.token_edit.setText(self._config.bot_token)
 
-        self.autostart_checkbox.set_checked_silent(self._config.autostart)
-        self.start_minimized_checkbox.set_checked_silent(self._config.start_minimized)
-        self.auto_start_bot_checkbox.set_checked_silent(self._config.auto_start_bot)
-        self.show_notifications_checkbox.set_checked_silent(self._config.show_notifications)
+            self.autostart_checkbox.set_checked_silent(self._config.autostart)
+            self.start_minimized_checkbox.set_checked_silent(self._config.start_minimized)
+            self.auto_start_bot_checkbox.set_checked_silent(self._config.auto_start_bot)
+            self.show_notifications_checkbox.set_checked_silent(self._config.show_notifications)
 
-        self.chk_allow_all_files.set_checked_silent(self._config.allow_all_files)
-        self.files_root_edit.setEnabled(not self._config.allow_all_files)
+            self.chk_allow_all_files.set_checked_silent(self._config.allow_all_files)
+            self.files_root_edit.setEnabled(not self._config.allow_all_files)
 
-        self.files_root_edit.setText(self._config.files_root)
-        self.edit_aa_dir.setText(self._config.autoaccept_templates_dir)
+            self.files_root_edit.setText(self._config.files_root)
+            self.edit_aa_dir.setText(self._config.autoaccept_templates_dir)
 
-        from copy import deepcopy
-        self._current_admins_data = {}
-        for admin_id, perms in self._config.admins.items():
-            self._current_admins_data[admin_id] = deepcopy(perms)
-            self.admins_list.addItem(admin_id)
+            from copy import deepcopy
+            self._current_admins_data = {}
+            self.admins_list.clear()
+            for admin_id, perms in self._config.admins.items():
+                self._current_admins_data[admin_id] = deepcopy(perms)
+                self.admins_list.addItem(admin_id)
 
-        if self.admins_list.count() > 0:
-            self.admins_list.setCurrentRow(0)
+            if self.admins_list.count() > 0:
+                self.admins_list.setCurrentRow(0)
+        finally:
+            self._loading_config = False
 
+        self._rebuild_permissions_matrix()
         self._refresh_state_cards()
         self.sync_autostart_ui(silent=True)
         self.load_last_log_lines()
         self.append_log(f'Config loaded from {self.config_manager.path}')
+        self._set_config_dirty(False)
+        self._refresh_live_panels()
 
     def _on_allow_all_files_toggled(self, checked: bool) -> None:
         self.files_root_edit.setEnabled(not checked)
@@ -980,11 +1433,18 @@ class MainWindow(QMainWindow):
 
     def _refresh_state_cards(self) -> None:
         self.bot_state_value.setText('ON' if self.bot_service.running else 'OFF')
-        self.admin_count_value.setText(str(len(self._config.admins)))
-        self.mode_value.setText('Трей' if self._config.start_minimized else 'Окно')
+        self.admin_count_value.setText(str(len(self._current_admins_data)))
+        start_minimized = self.start_minimized_checkbox.isChecked() if hasattr(self, 'start_minimized_checkbox') else self._config.start_minimized
+        self.mode_value.setText('Трей' if start_minimized else 'Окно')
+        if hasattr(self, 'dashboard_admins_value'):
+            self.dashboard_admins_value.setText(str(len(self._current_admins_data)))
 
     def _schedule_save(self, *_):
         """Сохранение конфига с задержкой (Debounce), чтобы не было фризов UI при быстром клике"""
+        if self._loading_config:
+            return
+        self._set_config_dirty(True)
+        self._refresh_state_cards()
         if hasattr(self, '_save_timer'):
             self._save_timer.stop()
         else:
@@ -1004,8 +1464,11 @@ class MainWindow(QMainWindow):
         self._config.allow_all_files = self.chk_allow_all_files.isChecked()
         self._config.files_root = self.files_root_edit.text().strip()
         self._config.autoaccept_templates_dir = self.edit_aa_dir.text().strip()
-        self.config_manager.save(self._config)
+        self._config = self.config_manager.save(self._config)
+        self._last_saved_at = time.time()
+        self._set_config_dirty(False)
         self._refresh_state_cards()
+        self._refresh_live_panels()
 
     def save_settings(self) -> bool:
         self._save_settings_immediate()
@@ -1054,21 +1517,36 @@ class MainWindow(QMainWindow):
         self.toggle_bot_button.style().unpolish(self.toggle_bot_button)
         self.toggle_bot_button.style().polish(self.toggle_bot_button)
         self.bot_state_value.setText('ON' if running else 'OFF')
+        self._refresh_live_panels()
 
     def append_log(self, message: str) -> None:
-        self.log_output.appendPlainText(message)
-        scroll = self.log_output.verticalScrollBar()
-        scroll.setValue(scroll.maximum())
+        record = self._make_log_record(message)
+        self._log_records.append(record)
+        if len(self._log_records) > 2000:
+            self._log_records = self._log_records[-2000:]
+        if str(record['level']) == 'ERROR':
+            self._last_logged_error_time = float(record['ts'])
+            self._last_logged_error_message = str(record['raw'])
+        self._render_logs()
+        self._refresh_dashboard()
 
     def load_last_log_lines(self) -> None:
         log_path = Path(LOG_FILE)
         if not log_path.exists():
+            self._log_records = []
             self.log_output.setPlainText('Лог-файл ещё не создан.')
+            self._refresh_status_bar()
             return
 
         lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
-        tail = '\n'.join(lines[-200:])
-        self.log_output.setPlainText(tail)
+        self._log_records = [self._make_log_record(line) for line in lines[-200:]]
+        self._last_logged_error_time = None
+        self._last_logged_error_message = None
+        for record in self._log_records:
+            if str(record['level']) == 'ERROR':
+                self._last_logged_error_time = float(record['ts'])
+                self._last_logged_error_message = str(record['raw'])
+        self._render_logs()
 
     def open_logs_folder(self) -> None:
         Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -1077,6 +1555,9 @@ class MainWindow(QMainWindow):
     def open_config_folder(self) -> None:
         self.config_manager.path.parent.mkdir(parents=True, exist_ok=True)
         startfile(str(self.config_manager.path.parent))
+
+    def open_install_dialog(self) -> None:
+        run_install_dialog(parent=self, force=True)
 
     def sync_autostart_ui(self, silent: bool = False) -> None:
         enabled = autostart.is_enabled()
@@ -1092,6 +1573,7 @@ class MainWindow(QMainWindow):
         if not silent:
             self.show_toast('🔄 Статус автозагрузки обновлен')
             self.append_log(f'Autostart registry value is currently: {"enabled" if enabled else "disabled"}')
+        self._refresh_live_panels()
 
     def copy_commands_to_clipboard(self) -> None:
         QApplication.clipboard().setText(HELP_TEXT)
@@ -1219,64 +1701,98 @@ class MainWindow(QMainWindow):
         QApplication.instance().quit()
 
 
-def check_first_run_and_install():
-    """Диалог установки при первом запуске"""
+def _current_install_source_path() -> Path:
     if getattr(sys, 'frozen', False):
-        current_path = Path(sys.executable).resolve()
-    else:
-        current_path = Path(__file__).resolve().parent
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve().parent
 
-    default_install_dir = Path.home() / 'AppData' / 'Local' / 'PCController'
 
-    if default_install_dir in current_path.parents or current_path.parent == default_install_dir:
-        return
+def _default_install_dir() -> Path:
+    return Path.home() / 'AppData' / 'Local' / 'PCController'
 
-    from .config import CONFIG_PATH
-    if CONFIG_PATH.exists():
-        return
 
-    dialog = InstallDialog()
+def _is_inside_install_dir(current_path: Path, install_dir: Path) -> bool:
+    return current_path == install_dir or install_dir in current_path.parents or current_path.parent == install_dir
+
+
+def run_install_dialog(parent=None, force: bool = False) -> None:
+    """Показывает диалог установки и при необходимости копирует программу в целевую папку."""
+    current_path = _current_install_source_path()
+    default_install_dir = _default_install_dir()
+    config_manager = ConfigManager()
+    config = config_manager.current()
+
+    if not force:
+        if not getattr(sys, 'frozen', False):
+            return
+        if _is_inside_install_dir(current_path, default_install_dir):
+            if not config.installed:
+                config.installed = True
+                config_manager.save(config)
+            return
+        if config.installed:
+            return
+
+    dialog = InstallDialog(parent)
     dialog.exec()
 
-    if dialog.action == "install":
-        target_dir = dialog.chosen_path.parent
-        try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            if getattr(sys, 'frozen', False):
-                target_exe = dialog.chosen_path
-                import shutil
-                shutil.copy2(current_path, target_exe)
-                installed_path = target_exe
-            else:
-                import shutil
-                shutil.copytree(current_path, target_dir, dirs_exist_ok=True)
-                installed_path = target_dir / current_path.name if current_path.is_file() else target_dir / 'main.py'
+    if dialog.action != "install":
+        if not force:
+            config.installed = True
+            config_manager.save(config)
+        return
 
-            if dialog.chk_desktop.isChecked() or dialog.chk_start_menu.isChecked():
-                try:
-                    from win32com.client import Dispatch
-                    shell = Dispatch('WScript.Shell')
+    target_dir = dialog.chosen_path.parent
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if getattr(sys, 'frozen', False):
+            target_exe = dialog.chosen_path
+            if target_exe.resolve() == current_path:
+                QMessageBox.information(parent, "Установка", "Программа уже запущена из этой папки.")
+                return
+            import shutil
+            shutil.copy2(current_path, target_exe)
+            installed_path = target_exe
+        else:
+            import shutil
+            shutil.copytree(current_path, target_dir, dirs_exist_ok=True)
+            installed_path = target_dir / current_path.name if current_path.is_file() else target_dir / 'main.py'
 
-                    if dialog.chk_desktop.isChecked():
-                        desktop = Path(shell.SpecialFolders("Desktop"))
-                        shortcut = shell.CreateShortCut(str(desktop / "PC Controller.lnk"))
-                        shortcut.Targetpath = str(installed_path)
-                        shortcut.WorkingDirectory = str(installed_path.parent)
-                        shortcut.save()
+        if dialog.chk_desktop.isChecked() or dialog.chk_start_menu.isChecked():
+            try:
+                from win32com.client import Dispatch
+                shell = Dispatch('WScript.Shell')
 
-                    if dialog.chk_start_menu.isChecked():
-                        programs = Path(shell.SpecialFolders("Programs"))
-                        shortcut = shell.CreateShortCut(str(programs / "PC Controller.lnk"))
-                        shortcut.Targetpath = str(installed_path)
-                        shortcut.WorkingDirectory = str(installed_path.parent)
-                        shortcut.save()
-                except Exception as e:
-                    print(f"Не удалось создать ярлыки: {e}")
+                if dialog.chk_desktop.isChecked():
+                    desktop = Path(shell.SpecialFolders("Desktop"))
+                    shortcut = shell.CreateShortCut(str(desktop / "PC Controller.lnk"))
+                    shortcut.Targetpath = str(installed_path)
+                    shortcut.WorkingDirectory = str(installed_path.parent)
+                    shortcut.IconLocation = str(installed_path)
+                    shortcut.save()
 
-            if getattr(sys, 'frozen', False):
-                subprocess.Popen([str(installed_path)])
-            else:
-                subprocess.Popen([sys.executable, str(installed_path)])
-            sys.exit(0)
-        except Exception as e:
-            QMessageBox.critical(None, "Ошибка", f"Не удалось скопировать файлы:\n{e}")
+                if dialog.chk_start_menu.isChecked():
+                    programs = Path(shell.SpecialFolders("Programs"))
+                    shortcut = shell.CreateShortCut(str(programs / "PC Controller.lnk"))
+                    shortcut.Targetpath = str(installed_path)
+                    shortcut.WorkingDirectory = str(installed_path.parent)
+                    shortcut.IconLocation = str(installed_path)
+                    shortcut.save()
+            except Exception as e:
+                print(f"Не удалось создать ярлыки: {e}")
+
+        config.installed = True
+        config_manager.save(config)
+
+        if getattr(sys, 'frozen', False):
+            subprocess.Popen([str(installed_path)])
+        else:
+            subprocess.Popen([sys.executable, str(installed_path)])
+        sys.exit(0)
+    except Exception as e:
+        QMessageBox.critical(parent, "Ошибка", f"Не удалось скопировать файлы:\n{e}")
+
+
+def check_first_run_and_install():
+    """Диалог установки при первом запуске."""
+    run_install_dialog(force=False)
