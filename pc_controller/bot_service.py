@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Callable
@@ -31,6 +32,7 @@ from telegram.ext import (
 )
 
 from .config import AppConfig
+from .clipboard_history import ClipboardHistoryService
 from .input_actions import (
     AUTOACCEPT_DIR,
     AutoAcceptConfig,
@@ -50,6 +52,8 @@ from .input_actions import (
     stop_anti_afk,
 )
 from .logging_setup import LOG_FILE
+from .ocr_actions import extract_text_from_image_bytes, find_matching_lines
+from .scheduler_store import ScheduledJob, SchedulerStore
 from .system_actions import (
     cancel_scheduled_power_action,
     hibernate_system,
@@ -63,13 +67,24 @@ from .system_actions import (
 )
 from .system_metrics import (
     capture_screenshot_bytes,
+    capture_webcam_photo,
+    capture_webcam_video,
     collect_snapshot,
     format_uptime,
     get_hardware_info,
     get_now_playing,
+    record_audio,
     start_security,
     stop_security,
     is_security_active
+)
+from .window_actions import (
+    activate_window,
+    capture_window_bytes as capture_window_bytes_for_window,
+    close_window,
+    get_window_info,
+    list_open_windows,
+    minimize_window,
 )
 
 from PySide6.QtWidgets import QLabel, QWidget, QVBoxLayout, QApplication
@@ -116,6 +131,24 @@ class OverlayWidget(QWidget):
 
 MAX_DOWNLOAD_FILE_SIZE = 45 * 1024 * 1024
 MAX_LIST_ITEMS = 120
+WINDOWS_PAGE_SIZE = 8
+CLIPBOARD_HISTORY_PAGE_SIZE = 6
+ALLOWED_SCHEDULE_ACTIONS = {
+    'screenshot',
+    'logsave',
+    'status',
+    'hwinfo',
+    'ocrscreen',
+    'clipboard',
+    'shutdown',
+    'reboot',
+    'hibernate',
+    'lock',
+    'sleep',
+    'webcam',
+    'webcamvid',
+    'audio',
+}
 
 HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 
@@ -148,6 +181,7 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 🔸 /tasklist [filter] - Список
 🔸 /kill_PID - Быстрое завершение (PID)
 🔸 /cmd &lt;команда&gt; - Выполнить в CMD
+🔸 /windows - Живые окна с действиями
 
 ⌨️ <b>Ввод и управление:</b>
 🔸 /printtext &lt;text&gt;
@@ -155,10 +189,15 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 🔸 /movemouse &lt;x&gt; &lt;y&gt; [sec]
 🔸 /message, /voice
 🔸 /clip [text] - Буфер обмена
+🔸 /cliphistory - История буфера
 🔸 /antiafkon, /antiafkoff - Anti-AFK
 🔸 /autoaccepton, /autoacceptoff
 
 🌐 <b>Прочее:</b>
+🔸 /ocr [query] - OCR текущего экрана
+🔸 /schedulein &lt;delay&gt; &lt;actions...&gt; [--if-cpu-below N] [--if-cpu-above N] [--if-ram-below N] [--if-ram-above N] [--comment text]
+🔸 /scheduleat &lt;HH:MM&gt; &lt;actions...&gt; [--note text]
+🔸 /jobs, /jobcancel &lt;JOB_ID&gt;
 🔸 /openurl &lt;link&gt;, /logtail [n]"""
 
 
@@ -194,6 +233,9 @@ class TelegramBotService(QObject):
         self._dir_items_by_user: dict[int, list[str]] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
+        self._clipboard_history = ClipboardHistoryService()
+        self._scheduler_store = SchedulerStore()
+        self._scheduler_task: asyncio.Task | None = None
         self._active_timers: dict[str, tuple[asyncio.Task, str]] = {}  # id -> (task, description)
         self._timer_targets: dict[str, float] = {}  # Хранит точное время завершения таймеров
         self._timer_counter = 0
@@ -353,6 +395,88 @@ class TelegramBotService(QObject):
                                            dismissable=True, as_toast=True)
                 except Exception as exc:
                     await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True, as_toast=True)
+                return
+
+            if arg.startswith('win_'):
+                if not await self._ensure_admin(update, 'process'): return
+                try:
+                    _, hwnd_str, page_str = arg.split('_', 2)
+                    hwnd = int(hwnd_str)
+                    page = int(page_str)
+                    text = await asyncio.to_thread(self._window_detail_text, hwnd)
+                    markup = self._window_detail_markup(hwnd, page)
+                    msg_id = self._menu_msg_id_by_user.get(update.effective_user.id)
+                    if msg_id:
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=update.effective_user.id,
+                                message_id=msg_id,
+                                text=text,
+                                reply_markup=markup,
+                                parse_mode=ParseMode.HTML,
+                            )
+                            return
+                        except Exception:
+                            pass
+                    await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                except Exception as exc:
+                    await self._safe_reply(update, f'❌ Ошибка окна: <code>{html.escape(str(exc))}</code>',
+                                           parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                return
+
+            if arg.startswith('proc_'):
+                if not await self._ensure_admin(update, 'process'): return
+                try:
+                    _, pid_str, page_str = arg.split('_', 2)
+                    pid = int(pid_str)
+                    page = int(page_str)
+                    text = await asyncio.to_thread(self._process_detail_text, pid)
+                    markup = self._process_detail_markup(pid, page)
+                    msg_id = self._menu_msg_id_by_user.get(update.effective_user.id)
+                    if msg_id:
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=update.effective_user.id,
+                                message_id=msg_id,
+                                text=text,
+                                reply_markup=markup,
+                                parse_mode=ParseMode.HTML,
+                            )
+                            return
+                        except Exception:
+                            pass
+                    await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                except Exception as exc:
+                    await self._safe_reply(update, f'❌ Ошибка процесса: <code>{html.escape(str(exc))}</code>',
+                                           parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+                return
+
+            if arg.startswith('sjdel_'):
+                if not await self._ensure_admin(update): return
+                user_id = update.effective_user.id
+                job_id = arg[6:].strip()
+                removed = self._scheduler_store.remove_job(job_id)
+                bot_username = context.bot.username
+                text, markup = self._build_scheduler_jobs_view(bot_username)
+                msg_id = self._menu_msg_id_by_user.get(user_id)
+                if msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=msg_id,
+                            text=text,
+                            reply_markup=markup,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                await self._safe_reply(
+                    update,
+                    '🗑 <b>Задача удалена.</b>' if removed else '❌ <b>Задача не найдена.</b>',
+                    parse_mode=ParseMode.HTML,
+                    dismissable=True,
+                    as_toast=True,
+                )
                 return
 
             if arg.startswith('rmf_'):
@@ -1492,6 +1616,75 @@ class TelegramBotService(QObject):
         if not action:
             return
 
+        if action == 'ocr_query':
+            if not await self._ensure_admin(update):
+                return
+            await self._run_screen_ocr(update, query=text.strip(), reply_markup=self._ocr_reply_markup())
+            return
+
+        if action == 'schedule_create':
+            if not await self._ensure_admin(update):
+                return
+            user_id = update.effective_user.id
+            msg_id = self._menu_msg_id_by_user.get(user_id)
+            raw_text = text.strip()
+            lowered = raw_text.lower()
+            try:
+                if lowered.startswith('/schedulein '):
+                    tokens = raw_text.split()[1:]
+                    mode = 'in'
+                elif lowered.startswith('/scheduleat '):
+                    tokens = raw_text.split()[1:]
+                    mode = 'at'
+                elif lowered.startswith('in '):
+                    tokens = raw_text.split()[1:]
+                    mode = 'in'
+                elif lowered.startswith('at '):
+                    tokens = raw_text.split()[1:]
+                    mode = 'at'
+                else:
+                    raise ValueError('Начните строку с <code>in</code> или <code>at</code>.')
+
+                if len(tokens) < 2:
+                    raise ValueError('Нужно указать время/задержку и хотя бы одно действие.')
+
+                job = await self._create_scheduled_job_from_mode(update, mode, tokens[0], tokens[1:])
+                if msg_id:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=msg_id,
+                        text=f'✅ <b>Задача создана</b>\n{self._format_scheduled_job(job)}\n\n{self._scheduler_panel_text()}',
+                        reply_markup=self._scheduler_panel_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await self._safe_reply(update, f'✅ <b>Задача создана</b>\n{self._format_scheduled_job(job)}',
+                                           parse_mode=ParseMode.HTML, dismissable=True)
+            except PermissionError:
+                return
+            except Exception as exc:
+                self._pending_action_by_user[user_id] = 'schedule_create'
+                error_text = (
+                    f'❌ <b>Ошибка создания задачи:</b> <code>{html.escape(str(exc))}</code>\n\n'
+                    f'{self._scheduler_add_text()}'
+                )
+                if msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=msg_id,
+                            text=error_text,
+                            reply_markup=self._scheduler_add_markup(),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        await self._safe_reply(update, error_text, parse_mode=ParseMode.HTML,
+                                               reply_markup=self._scheduler_add_markup())
+                else:
+                    await self._safe_reply(update, error_text, parse_mode=ParseMode.HTML,
+                                           reply_markup=self._scheduler_add_markup())
+            return
+
         if action in ('type', 'printtext', 'combination', 'message', 'voice', 'cmd', 'clip_set', 'custom_remind'):
             if not await self._ensure_admin(update, 'input'): return
             user_id = update.effective_user.id
@@ -1571,6 +1764,8 @@ class TelegramBotService(QObject):
                     result = await asyncio.to_thread(speak_text, text)
                 elif action == 'clip_set':
                     result = await asyncio.to_thread(set_clipboard, text)
+                    if result.ok:
+                        self._clipboard_history.add_text(text)
                 elif action == 'cmd':
                     result = await asyncio.to_thread(run_cmd, text)
                     self.log_message.emit(f"CMD run: {text}")
@@ -1584,6 +1779,23 @@ class TelegramBotService(QObject):
                 await self._safe_reply(update, f'❌ Ошибка: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
             finally:
+                if action == 'clip_set' and msg_id:
+                    try:
+                        self._pending_action_by_user[user_id] = 'clip_set'
+                        panel_text, panel_markup = await self._build_clipboard_panel_view(
+                            status_text=result.message if 'result' in locals() else 'Ошибка буфера обмена.',
+                            is_error=not result.ok if 'result' in locals() else True,
+                        )
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=msg_id,
+                            text=panel_text,
+                            reply_markup=panel_markup,
+                            parse_mode=ParseMode.HTML,
+                        )
+                        msg_id = None
+                    except Exception:
+                        pass
                 if msg_id:
                     try:
                         markup = self._panel_process_markup() if action == 'cmd' else self._panel_input_markup()
@@ -1851,11 +2063,13 @@ class TelegramBotService(QObject):
         try:
             if text:
                 result = await asyncio.to_thread(set_clipboard, text)
+                if result.ok:
+                    self._clipboard_history.add_text(text)
                 await self._safe_reply(update, f'📋 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             else:
                 result = await asyncio.to_thread(get_clipboard)
                 if result.ok:
-                    markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]])
+                    markup = self._clipboard_reply_markup()
                     msg_text = f'📋 <b>Текст из буфера обмена ПК:</b>\n\n<code>{html.escape(result.message)}</code>'
                     if update.callback_query:
                         await self._edit_panel_message(update.callback_query, msg_text, markup)
@@ -2024,6 +2238,1174 @@ class TelegramBotService(QObject):
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /autoacceptoff: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+
+    async def _command_clip_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'input'):
+            return
+        text, markup = self._build_clipboard_history_page(0)
+        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def _command_windows(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'process'):
+            return
+        bot_username = self._application.bot.username
+        text, total_pages = await asyncio.to_thread(self._build_windows_page, bot_username, 0)
+        markup = self._windows_list_markup(0, total_pages)
+        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def _command_ocr(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update):
+            return
+        query = ' '.join(context.args).strip() if context.args else ''
+        await self._run_screen_ocr(update, query=query or None, reply_markup=self._dismiss_markup())
+
+    @staticmethod
+    def _trim_button_label(text: str, max_len: int = 30) -> str:
+        cleaned = ' '.join((text or '').split())
+        if len(cleaned) <= max_len:
+            return cleaned
+        return cleaned[:max_len - 1] + '…'
+
+    def _build_clipboard_history_page(self, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        entries = self._clipboard_history.snapshot()
+        total_pages = max(1, (len(entries) + CLIPBOARD_HISTORY_PAGE_SIZE - 1) // CLIPBOARD_HISTORY_PAGE_SIZE)
+        safe_page = max(0, min(page, total_pages - 1))
+        start = safe_page * CLIPBOARD_HISTORY_PAGE_SIZE
+        current_items = entries[start:start + CLIPBOARD_HISTORY_PAGE_SIZE]
+
+        lines = ['📋 <b>История буфера обмена</b>']
+        if current_items:
+            lines.append('')
+            for index, entry in enumerate(current_items, start=start + 1):
+                stamp = datetime.fromtimestamp(entry.created_at).strftime('%H:%M:%S')
+                preview = html.escape(self._clipboard_history.preview(entry.text, max_len=70))
+                lines.append(f'{index}. <code>{stamp}</code> — {preview}')
+        else:
+            lines.append('\nИстория пока пуста.')
+
+        buttons: list[list[InlineKeyboardButton]] = []
+        for index, entry in enumerate(current_items, start=start + 1):
+            label = f'{index}. {self._trim_button_label(self._clipboard_history.preview(entry.text, max_len=26), 26)}'
+            buttons.append([InlineKeyboardButton(label, callback_data=f'panel:cliphist:view:{entry.entry_id}:{safe_page}')])
+
+        nav_row = []
+        if safe_page > 0:
+            nav_row.append(InlineKeyboardButton('⬅️', callback_data=f'panel:cliphist:page:{safe_page - 1}'))
+        if safe_page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton('➡️', callback_data=f'panel:cliphist:page:{safe_page + 1}'))
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:input:clip')])
+        return '\n'.join(lines), InlineKeyboardMarkup(buttons)
+
+    def _build_clipboard_entry_view(self, entry_id: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        entry = self._clipboard_history.get(entry_id)
+        if entry is None:
+            return (
+                '❌ <b>Элемент истории не найден.</b>',
+                InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data=f'panel:cliphist:page:{page}')]]),
+            )
+
+        stamp = datetime.fromtimestamp(entry.created_at).strftime('%d.%m.%Y %H:%M:%S')
+        text = (
+            f'📋 <b>Элемент истории буфера</b>\n'
+            f'🕒 <code>{stamp}</code>\n\n'
+            f'<code>{html.escape(entry.text[:3500])}</code>'
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton('♻️ Вернуть в буфер', callback_data=f'panel:cliphist:restore:{entry.entry_id}:{page}')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data=f'panel:cliphist:page:{page}')],
+        ])
+        return text, markup
+
+    @staticmethod
+    def _clipboard_panel_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('🕘 История буфера', callback_data='panel:input:clip_history')],
+            [InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')],
+        ])
+
+    @staticmethod
+    def _build_clipboard_panel_text(clipboard_text: str, status_text: str | None = None, is_error: bool = False) -> str:
+        status_block = ''
+        if status_text:
+            prefix = '❌' if is_error else '✅'
+            status_block = f'{prefix} <b>{html.escape(status_text)}</b>\n\n'
+        return (
+            '📋 <b>Буфер обмена</b>\n\n'
+            f'{status_block}'
+            '<b>Текущее содержимое:</b>\n'
+            f'<code>{html.escape(clipboard_text)}</code>\n\n'
+            'Отправьте текст, чтобы заменить содержимое буфера обмена ПК.'
+        )
+
+    async def _build_clipboard_panel_view(
+            self,
+            status_text: str | None = None,
+            is_error: bool = False,
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        result = await asyncio.to_thread(get_clipboard)
+        current_text = result.message if result.ok else f'Ошибка чтения буфера: {result.message}'
+        return self._build_clipboard_panel_text(current_text, status_text=status_text, is_error=is_error), self._clipboard_panel_markup()
+
+    def _build_windows_page(self, bot_username: str, page: int) -> tuple[str, int]:
+        windows = list_open_windows()
+        total_pages = max(1, (len(windows) + WINDOWS_PAGE_SIZE - 1) // WINDOWS_PAGE_SIZE)
+        safe_page = max(0, min(page, total_pages - 1))
+        start = safe_page * WINDOWS_PAGE_SIZE
+        current_items = windows[start:start + WINDOWS_PAGE_SIZE]
+
+        lines = ['🪟 <b>Живые окна</b>']
+        if current_items:
+            lines.append('')
+            for index, info in enumerate(current_items, start=start + 1):
+                state = 'свернуто' if info.minimized else 'открыто'
+                action_link = f'https://t.me/{bot_username}?start=win_{info.hwnd}_{safe_page}'
+                lines.append(
+                    f'{index}. 🪟 <a href="{action_link}">{html.escape(info.title)}</a>\n'
+                    f'   <code>{html.escape(info.process_name)}</code> • HWND <code>{info.hwnd}</code> • {state}'
+                )
+        else:
+            lines.append('\nОткрытые окна не найдены.')
+
+        return '\n'.join(lines), total_pages
+
+    def _window_detail_text(self, hwnd: int) -> str:
+        info = get_window_info(hwnd)
+        left, top, right, bottom = info.rect
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        state = 'Свернуто' if info.minimized else 'Открыто'
+        return (
+            f'🪟 <b>Окно</b>\n'
+            f'📌 <b>Заголовок:</b> <code>{html.escape(info.title)}</code>\n'
+            f'⚙️ <b>Процесс:</b> <code>{html.escape(info.process_name)}</code> (PID <code>{info.pid}</code>)\n'
+            f'🆔 <b>HWND:</b> <code>{info.hwnd}</code>\n'
+            f'📐 <b>Размер:</b> <code>{width}x{height}</code>\n'
+            f'📦 <b>Состояние:</b> <code>{state}</code>'
+        )
+
+    @staticmethod
+    def _windows_list_markup(page: int, total_pages: int) -> InlineKeyboardMarkup:
+        safe_page = max(0, min(page, max(total_pages - 1, 0)))
+        buttons = []
+        nav_row = []
+        if safe_page > 0:
+            nav_row.append(InlineKeyboardButton('⬅️ Вверх', callback_data=f'panel:win:page:{safe_page - 1}'))
+        if safe_page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton('Вниз ➡️', callback_data=f'panel:win:page:{safe_page + 1}'))
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([InlineKeyboardButton('🔄 Обновить', callback_data=f'panel:win:page:{safe_page}')])
+        buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:process')])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def _window_detail_markup(hwnd: int, page: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('🎯 Активировать', callback_data=f'panel:win:activate:{hwnd}:{page}'),
+             InlineKeyboardButton('🗕 Свернуть', callback_data=f'panel:win:minimize:{hwnd}:{page}')],
+            [InlineKeyboardButton('📸 Скрин окна', callback_data=f'panel:win:screenshot:{hwnd}:{page}'),
+             InlineKeyboardButton('🔎 OCR окна', callback_data=f'panel:win:ocr:{hwnd}:{page}')],
+            [InlineKeyboardButton('❌ Закрыть окно', callback_data=f'panel:win:close:{hwnd}:{page}')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data=f'panel:win:page:{page}')],
+        ])
+
+    @staticmethod
+    def _window_reply_markup(hwnd: int, page: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Назад к окну', callback_data=f'panel:win:view:{hwnd}:{page}')]
+        ])
+
+    def _process_detail_text(self, pid: int) -> str:
+        try:
+            process = psutil.Process(int(pid))
+        except psutil.NoSuchProcess as exc:
+            raise RuntimeError('Процесс не найден или уже завершён.') from exc
+
+        def safe(callable_obj, default: str = 'недоступно'):
+            try:
+                value = callable_obj()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return default
+            except Exception:
+                return default
+            if value in (None, ''):
+                return default
+            return value
+
+        with process.oneshot():
+            name = str(safe(process.name, 'unknown'))
+            status = str(safe(process.status))
+            exe = str(safe(process.exe))
+            cwd = str(safe(process.cwd))
+            username = str(safe(process.username))
+            created_at_value = safe(process.create_time, 0.0)
+            if isinstance(created_at_value, (int, float)) and created_at_value:
+                created_at = datetime.fromtimestamp(created_at_value).strftime('%d.%m.%Y %H:%M:%S')
+            else:
+                created_at = 'недоступно'
+            cmdline_value = safe(process.cmdline, [])
+            if isinstance(cmdline_value, list):
+                cmdline = ' '.join(str(part) for part in cmdline_value if str(part).strip())
+            else:
+                cmdline = str(cmdline_value)
+            cmdline = cmdline or 'недоступно'
+            cmdline = cmdline[:1200]
+            memory_info = safe(process.memory_info)
+            if memory_info == 'недоступно':
+                rss_text = 'недоступно'
+                vms_text = 'недоступно'
+            else:
+                rss_text = self._format_bytes(int(memory_info.rss))
+                vms_text = self._format_bytes(int(memory_info.vms))
+            num_threads = safe(process.num_threads)
+            ppid = safe(process.ppid)
+
+        window_count = 0
+        try:
+            window_count = sum(1 for item in list_open_windows() if item.pid == int(pid))
+        except Exception:
+            window_count = 0
+
+        return (
+            '⚙️ <b>Процесс</b>\n'
+            f'📌 <b>Имя:</b> <code>{html.escape(name)}</code>\n'
+            f'🆔 <b>PID:</b> <code>{pid}</code>\n'
+            f'📁 <b>Путь:</b> <code>{html.escape(str(exe)[:1200])}</code>\n'
+            f'📂 <b>CWD:</b> <code>{html.escape(str(cwd)[:1000])}</code>\n'
+            f'👤 <b>Пользователь:</b> <code>{html.escape(username)}</code>\n'
+            f'📦 <b>Статус:</b> <code>{html.escape(status)}</code>\n'
+            f'🕒 <b>Запущен:</b> <code>{html.escape(created_at)}</code>\n'
+            f'🧠 <b>RAM RSS:</b> <code>{html.escape(rss_text)}</code>\n'
+            f'💾 <b>VMS:</b> <code>{html.escape(vms_text)}</code>\n'
+            f'🧵 <b>Потоки:</b> <code>{html.escape(str(num_threads))}</code>\n'
+            f'🌳 <b>PPID:</b> <code>{html.escape(str(ppid))}</code>\n'
+            f'🪟 <b>Окон:</b> <code>{window_count}</code>\n\n'
+            f'⌨️ <b>Командная строка:</b>\n<code>{html.escape(cmdline)}</code>'
+        )
+
+    @staticmethod
+    def _process_detail_markup(pid: int, page: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('🔄 Обновить', callback_data=f'panel:proc:info:{pid}:{page}')],
+            [InlineKeyboardButton('☠️ Завершить процесс', callback_data=f'panel:proc:kill:{pid}:{page}')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data=f'panel:proc:page:{page}')],
+        ])
+
+    @staticmethod
+    def _close_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('👌 Закрыть', callback_data='panel:dismiss')]
+        ])
+
+    @staticmethod
+    def _clipboard_reply_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input:clip')]
+        ])
+
+    @staticmethod
+    def _ocr_reply_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:ocr')]
+        ])
+
+    @staticmethod
+    def _ocr_menu_text() -> str:
+        return (
+            '🔎 <b>OCR</b>\n\n'
+            'Распознавание текста с текущего экрана.\n'
+            'Можно получить весь текст или отправить запрос для поиска фразы, кода или номера.'
+        )
+
+    @staticmethod
+    def _ocr_menu_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('🖼 OCR экрана', callback_data='panel:ocr:screen')],
+            [InlineKeyboardButton('🔎 Найти текст на экране', callback_data='panel:ocr:find')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')],
+        ])
+
+    def _format_ocr_report(self, result, source_label: str, query: str | None = None) -> str:
+        if not result.text:
+            return f'🔎 <b>OCR: {html.escape(source_label)}</b>\n\nТекст не найден.'
+
+        if query:
+            matches = find_matching_lines(result.lines, query)
+            if matches:
+                body = '\n'.join(f'• {html.escape(line)}' for line in matches[:20])
+                if len(matches) > 20:
+                    body += f'\n• … ещё {len(matches) - 20}'
+                return (
+                    f'🔎 <b>OCR: {html.escape(source_label)}</b>\n'
+                    f'Ищу: <code>{html.escape(query)}</code>\n\n{body}'
+                )
+            return (
+                f'🔎 <b>OCR: {html.escape(source_label)}</b>\n'
+                f'Ищу: <code>{html.escape(query)}</code>\n\nСовпадений не найдено.'
+            )
+
+        text = result.text[:3500]
+        if len(result.text) > 3500:
+            text += '\n...[ОБРЕЗАНО]...'
+        return f'🔎 <b>OCR: {html.escape(source_label)}</b>\n\n<pre>{html.escape(text)}</pre>'
+
+    async def _run_screen_ocr(
+            self,
+            update: Update,
+            query: str | None = None,
+            reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        temp_msg = None
+        if not update.callback_query:
+            temp_msg = await self._send_temporary_status(update, '⏳ <b>Распознаю текст с экрана...</b>')
+
+        try:
+            screenshot_bytes, _ = await asyncio.to_thread(capture_screenshot_bytes)
+            ocr_result = await extract_text_from_image_bytes(screenshot_bytes)
+            text = self._format_ocr_report(ocr_result, 'экран', query=query)
+            await self._safe_reply(
+                update,
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup or self._ocr_menu_markup(),
+            )
+        except Exception as exc:
+            await self._safe_reply(
+                update,
+                f'❌ Ошибка OCR: <code>{html.escape(str(exc))}</code>',
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup or self._ocr_menu_markup(),
+            )
+        finally:
+            if temp_msg:
+                await self._delete_message_safe(temp_msg)
+
+    async def _run_window_ocr(self, update: Update, hwnd: int, page: int) -> None:
+        try:
+            image_bytes, _ = await asyncio.to_thread(capture_window_bytes_for_window, hwnd)
+            ocr_result = await extract_text_from_image_bytes(image_bytes)
+            text = self._format_ocr_report(ocr_result, f'окно {hwnd}')
+            await self._safe_reply(
+                update,
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._window_reply_markup(hwnd, page),
+            )
+        except Exception as exc:
+            await self._safe_reply(
+                update,
+                f'❌ Ошибка OCR окна: <code>{html.escape(str(exc))}</code>',
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._window_reply_markup(hwnd, page),
+            )
+
+    @staticmethod
+    def _format_schedule_action(action: str) -> str:
+        action_name, action_value = TelegramBotService._parse_scheduled_action_spec(action)
+        mapping = {
+            'screenshot': 'скриншот',
+            'logsave': 'сохранить лог',
+            'status': 'статус системы',
+            'hwinfo': 'железо и датчики',
+            'ocrscreen': 'OCR экрана',
+            'clipboard': 'буфер обмена',
+            'shutdown': 'выключение',
+            'reboot': 'перезагрузка',
+            'hibernate': 'гибернация',
+            'lock': 'блокировка',
+            'sleep': 'сон',
+            'webcam': 'фото с вебки',
+            'webcamvid': f'видео с вебки {action_value}с' if action_value is not None else 'видео с вебки',
+            'audio': f'аудио {action_value}с' if action_value is not None else 'аудио',
+        }
+        return mapping.get(action_name, action)
+
+    @staticmethod
+    def _parse_duration_token(raw: str) -> int:
+        value = str(raw or '').strip().lower()
+        match = re.fullmatch(r'(\d+)([smhd]?)', value)
+        if not match:
+            raise ValueError('Неверный формат задержки. Используйте 120, 10m, 2h или 1d.')
+        amount = int(match.group(1))
+        suffix = match.group(2) or 's'
+        multipliers = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+        return amount * multipliers[suffix]
+
+    @staticmethod
+    def _normalize_schedule_token(raw_token: str) -> str:
+        token = str(raw_token or '').strip()
+        if not token:
+            return ''
+        dash_chars = '\u2010\u2011\u2012\u2013\u2014\u2015\u2212'
+        for dash in dash_chars:
+            token = token.replace(dash, '-')
+        if token.startswith('-') and not token.startswith('--') and len(token) > 1 and token[1].isalpha():
+            token = '-' + token
+        return token
+
+    @staticmethod
+    def _parse_scheduled_action_spec(action: str) -> tuple[str, int | None]:
+        raw = TelegramBotService._normalize_schedule_token(action).lower()
+        if raw == 'webcam':
+            return 'webcam', None
+        if raw in {
+            'status',
+            'hwinfo',
+            'ocr',
+            'ocrscreen',
+            'clipboard',
+            'clip',
+            'screenshot',
+            'logsave',
+            'shutdown',
+            'reboot',
+            'hibernate',
+            'lock',
+            'sleep',
+        }:
+            if raw in {'ocr', 'ocrscreen'}:
+                return 'ocrscreen', None
+            if raw in {'clipboard', 'clip'}:
+                return 'clipboard', None
+            return raw, None
+
+        webcam_match = re.fullmatch(r'(?:webcamvid|webcam)(?::|=)?(\d+)', raw)
+        if webcam_match:
+            return 'webcamvid', max(1, min(300, int(webcam_match.group(1))))
+
+        audio_match = re.fullmatch(r'audio(?::|=)?(\d+)', raw)
+        if audio_match:
+            return 'audio', max(1, min(300, int(audio_match.group(1))))
+
+        raise ValueError(f'Неизвестное действие: {action}')
+
+    def _parse_schedule_actions(self, args: list[str]) -> tuple[list[str], dict[str, float | str], str]:
+        if not args:
+            raise ValueError('Не указаны действия для планировщика.')
+
+        actions: list[str] = []
+        options: dict[str, float | str] = {}
+        note = ''
+        idx = 0
+        while idx < len(args):
+            token = self._normalize_schedule_token(args[idx])
+            if not token:
+                idx += 1
+                continue
+            if token == '--if-cpu-below':
+                idx += 1
+                if idx >= len(args):
+                    raise ValueError('После --if-cpu-below нужно указать число.')
+                options['cpu_below'] = float(str(args[idx]).replace('%', '').replace(',', '.'))
+                idx += 1
+                continue
+            if token == '--if-cpu-above':
+                idx += 1
+                if idx >= len(args):
+                    raise ValueError('После --if-cpu-above нужно указать число.')
+                options['cpu_above'] = float(str(args[idx]).replace('%', '').replace(',', '.'))
+                idx += 1
+                continue
+            if token == '--if-ram-below':
+                idx += 1
+                if idx >= len(args):
+                    raise ValueError('После --if-ram-below нужно указать число.')
+                options['ram_below'] = float(str(args[idx]).replace('%', '').replace(',', '.'))
+                idx += 1
+                continue
+            if token == '--if-ram-above':
+                idx += 1
+                if idx >= len(args):
+                    raise ValueError('После --if-ram-above нужно указать число.')
+                options['ram_above'] = float(str(args[idx]).replace('%', '').replace(',', '.'))
+                idx += 1
+                continue
+            if token in {'--comment', '--note'}:
+                idx += 1
+                note_parts: list[str] = []
+                while idx < len(args):
+                    candidate = self._normalize_schedule_token(args[idx])
+                    if candidate in {'--if-cpu-below', '--if-cpu-above', '--if-ram-below', '--if-ram-above', '--comment', '--note'}:
+                        break
+                    if candidate:
+                        note_parts.append(candidate)
+                    idx += 1
+                if not note_parts:
+                    raise ValueError('После --comment/--note нужно указать текст комментария.')
+                note = ' '.join(note_parts).strip()[:160]
+                continue
+
+            for part in token.split(','):
+                cleaned = self._normalize_schedule_token(part).strip().lower()
+                if cleaned:
+                    action_name, action_value = self._parse_scheduled_action_spec(cleaned)
+                    if action_value is None:
+                        actions.append(action_name)
+                    else:
+                        actions.append(f'{action_name}:{action_value}')
+            idx += 1
+
+        if not actions:
+            raise ValueError('Не удалось распознать действия планировщика.')
+
+        invalid = []
+        for action in actions:
+            try:
+                action_name, _ = self._parse_scheduled_action_spec(action)
+            except ValueError:
+                invalid.append(action)
+                continue
+            if action_name not in ALLOWED_SCHEDULE_ACTIONS:
+                invalid.append(action)
+        if invalid:
+            raise ValueError(f'Неизвестные действия: {", ".join(invalid)}')
+        return actions, options, note
+
+    async def _ensure_schedule_permissions(self, update: Update, actions: list[str]) -> bool:
+        action_names = [self._parse_scheduled_action_spec(action)[0] for action in actions]
+        power_actions = {'shutdown', 'reboot', 'hibernate', 'lock', 'sleep'}
+        media_actions = {'webcam', 'webcamvid', 'audio'}
+        if any(action in power_actions for action in action_names):
+            if not await self._ensure_admin(update, 'power'):
+                return False
+        if any(action in media_actions for action in action_names):
+            if not await self._ensure_admin(update, 'media'):
+                return False
+        return await self._ensure_admin(update)
+
+    @staticmethod
+    def _format_schedule_note(note: str) -> str:
+        cleaned = str(note or '').strip()
+        if not cleaned:
+            return ''
+        return f'\n💬 <i>{html.escape(cleaned)}</i>'
+
+    def _format_scheduled_job(self, job: ScheduledJob) -> str:
+        when = datetime.fromtimestamp(job.run_at).strftime('%d.%m %H:%M:%S')
+        actions = ', '.join(self._format_schedule_action(action) for action in job.actions)
+        conditions = []
+        if job.cpu_below is not None:
+            conditions.append(f'CPU ≤ {job.cpu_below:.1f}%')
+        if job.cpu_above is not None:
+            conditions.append(f'CPU ≥ {job.cpu_above:.1f}%')
+        if job.ram_below is not None:
+            conditions.append(f'RAM ≤ {job.ram_below:.1f}%')
+        if job.ram_above is not None:
+            conditions.append(f'RAM ≥ {job.ram_above:.1f}%')
+        conditions_text = f' • {" • ".join(conditions)}' if conditions else ''
+        return f'<code>{job.job_id}</code> • {when} • {html.escape(actions)}{conditions_text}{self._format_schedule_note(job.note)}'
+
+    @staticmethod
+    def _scheduler_add_text() -> str:
+        return (
+            '➕ <b>Добавить задачу</b>\n\n'
+            'Отправьте одной строкой задачу в формате:\n'
+            '<code>in 2h screenshot logsave --comment Ночной скрин</code>\n'
+            '<code>at 03:00 reboot --note Ночной ребут</code>\n'
+            '<code>in 25m webcam:15 audio:20 —comment Ночная проверка</code>\n'
+            '<code>in 20m ocrscreen clipboard --if-ram-below 70 --comment Что на экране и в буфере</code>\n\n'
+            'Поддерживается:\n'
+            '<code>in DELAY actions... [--if-cpu-below N] [--if-cpu-above N] [--if-ram-below N] [--if-ram-above N] [--comment Текст]</code>\n'
+            '<code>at HH:MM actions... [--if-cpu-below N] [--if-cpu-above N] [--if-ram-below N] [--if-ram-above N] [--note Текст]</code>\n\n'
+            'Действия: <code>screenshot</code>, <code>logsave</code>, <code>status</code>, <code>hwinfo</code>, <code>ocrscreen</code>, <code>clipboard</code>, '
+            '<code>webcam</code>, <code>webcam:15</code>/<code>webcamvid:15</code>, <code>audio:20</code>, <code>lock</code>, <code>sleep</code>, '
+            '<code>hibernate</code>, <code>shutdown</code>, <code>reboot</code>'
+        )
+
+    @staticmethod
+    def _scheduler_add_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('❓ Справка', callback_data='panel:sched:help')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:sched')],
+        ])
+
+    def _scheduler_panel_text(self) -> str:
+        jobs = self._scheduler_store.list_jobs()
+        examples = (
+            '<code>/schedulein 15m webcam --comment Проверка вебки</code>\n'
+            '<code>/schedulein 30m screenshot logsave status --comment Ночной лог</code>\n'
+            '<code>/schedulein 25m webcam:15 audio:20 --if-cpu-below 12 --comment Ночная проверка</code>\n'
+            '<code>/schedulein 2h shutdown --if-cpu-below 10 --if-ram-below 60 --note Выключить если простаивает</code>\n'
+            '<code>/schedulein 20m ocrscreen clipboard --if-cpu-above 15 --comment Проверить экран и буфер</code>\n'
+            '<code>/scheduleat 03:00 screenshot logsave hwinfo reboot --comment Ночной ребут</code>\n'
+            '<code>/jobs</code> • <code>/jobcancel JOB_ID</code>'
+        )
+        return (
+            '🗓 <b>Планировщик</b>\n\n'
+            f'Активных задач: <code>{len(jobs)}</code>\n\n'
+            'Через кнопку ниже можно добавить задачу прямо из панели.\n\n'
+            'Поддерживаемые действия: <code>screenshot</code>, <code>logsave</code>, <code>status</code>, <code>hwinfo</code>, <code>ocrscreen</code>, '
+            '<code>clipboard</code>, <code>webcam</code>, <code>webcam:15</code>, <code>audio:20</code>, <code>shutdown</code>, '
+            '<code>reboot</code>, <code>hibernate</code>, <code>lock</code>, <code>sleep</code>\n\n'
+            f'{examples}'
+        )
+
+    @staticmethod
+    def _scheduler_panel_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('➕ Добавить задачу', callback_data='panel:sched:add')],
+            [InlineKeyboardButton('📋 Активные задачи', callback_data='panel:sched:list')],
+            [InlineKeyboardButton('❓ Справка и команды', callback_data='panel:sched:help')],
+            [InlineKeyboardButton('🧹 Очистить всё', callback_data='panel:sched:clear')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')],
+        ])
+
+    def _scheduler_help_text(self) -> str:
+        return (
+            '🗓 <b>Справка по планировщику</b>\n\n'
+            'Комментарии:\n'
+            '• Используйте <code>--comment Текст</code> или <code>--note Текст</code>\n'
+            '• Комментарий сохраняется в задаче, показывается в списке и приходит в уведомлениях\n\n'
+            'Telegram-особенность:\n'
+            '• Длинное тире <code>—comment</code> и <code>–if-cpu-below</code> тоже понимается как обычное <code>--comment</code>\n\n'
+            'Условия:\n'
+            '• <code>--if-cpu-below 10</code> выполнит задачу только если CPU не выше 10%\n\n'
+            '• <code>--if-cpu-above 70</code> выполнит задачу только если CPU не ниже 70%\n'
+            '• <code>--if-ram-below 60</code> выполнит задачу только если RAM не выше 60%\n'
+            '• <code>--if-ram-above 90</code> выполнит задачу только если RAM не ниже 90%\n\n'
+            'Команды:\n'
+            '<code>/schedulein 15m screenshot --comment Быстрый скрин</code>\n'
+            '<code>/schedulein 30m screenshot logsave status --note Логи перед сном</code>\n'
+            '<code>/schedulein 20m webcam --comment Проверка камеры</code>\n'
+            '<code>/schedulein 25m audio:20 --comment Что слышно</code>\n'
+            '<code>/schedulein 40m webcam:15 --comment Короткое видео</code>\n'
+            '<code>/schedulein 20m ocrscreen --comment Прочитать экран</code>\n'
+            '<code>/schedulein 20m clipboard --comment Отправить буфер</code>\n'
+            '<code>/schedulein 1h sleep --comment Усыпить ПК</code>\n'
+            '<code>/schedulein 2h shutdown --if-cpu-below 10 --if-ram-below 60 --note Выключить если простаивает</code>\n'
+            '<code>/scheduleat 03:00 reboot --comment Ночной ребут</code>\n'
+            '<code>/scheduleat 03:00 screenshot logsave hwinfo reboot --comment Ночной ребут с логами</code>\n'
+            '<code>/jobs</code>\n'
+            '<code>/jobcancel JOB_ID</code>\n\n'
+            'Действия:\n'
+            '• <code>screenshot</code> — скриншот экрана\n'
+            '• <code>logsave</code> — сохранить текущий лог\n'
+            '• <code>status</code> — краткий статус системы\n'
+            '• <code>hwinfo</code> — железо и датчики\n'
+            '• <code>ocr</code> / <code>ocrscreen</code> — распознать текст с текущего экрана\n'
+            '• <code>clip</code> / <code>clipboard</code> — отправить текущий текст из буфера обмена\n'
+            '• <code>webcam</code> — фото с веб-камеры\n'
+            '• <code>webcam:15</code> или <code>webcamvid:15</code> — видео с вебки 15 секунд\n'
+            '• <code>audio:20</code> — запись микрофона 20 секунд\n'
+            '• <code>lock</code>, <code>sleep</code>, <code>hibernate</code>, <code>shutdown</code>, <code>reboot</code>'
+        )
+
+    @staticmethod
+    def _scheduler_help_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('➕ Добавить задачу', callback_data='panel:sched:add')],
+            [InlineKeyboardButton('📋 Активные задачи', callback_data='panel:sched:list')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:sched')],
+        ])
+
+    def _build_scheduler_jobs_view(self, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+        jobs = self._scheduler_store.list_jobs()
+        if not jobs:
+            return (
+                '🗓 <b>Планировщик</b>\n\nНет активных задач.',
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton('➕ Добавить задачу', callback_data='panel:sched:add')],
+                    [InlineKeyboardButton('⬅️ Назад', callback_data='panel:sched')],
+                ]),
+            )
+
+        lines = ['🗓 <b>Активные задачи</b>', '']
+        buttons: list[list[InlineKeyboardButton]] = []
+        for job in jobs[:20]:
+            delete_link = f'https://t.me/{bot_username}?start=sjdel_{job.job_id}'
+            lines.append(f'<a href="{delete_link}">❌</a> {self._format_scheduled_job(job)}')
+        buttons.append([InlineKeyboardButton('➕ Добавить задачу', callback_data='panel:sched:add')])
+        buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data='panel:sched')])
+        return '\n'.join(lines), InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def _parse_schedule_clock(raw_value: str) -> datetime:
+        match = re.fullmatch(r'(\d{1,2}):(\d{2})', raw_value.strip())
+        if not match:
+            raise ValueError('Время должно быть в формате HH:MM.')
+        target_h = int(match.group(1))
+        target_m = int(match.group(2))
+        now = datetime.now()
+        run_at_dt = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+        if run_at_dt <= now:
+            run_at_dt += timedelta(days=1)
+        return run_at_dt
+
+    async def _create_scheduled_job_from_mode(
+            self,
+            update: Update,
+            mode: str,
+            schedule_value: str,
+            args: list[str],
+    ) -> ScheduledJob:
+        actions, options, note = self._parse_schedule_actions(args)
+        if not await self._ensure_schedule_permissions(update, actions):
+            raise PermissionError('Недостаточно прав для выбранных действий.')
+
+        if mode == 'in':
+            run_at = time.time() + self._parse_duration_token(schedule_value)
+        elif mode == 'at':
+            run_at = self._parse_schedule_clock(schedule_value).timestamp()
+        else:
+            raise ValueError('Неизвестный режим планировщика.')
+
+        return self._scheduler_store.add_job(
+            run_at=run_at,
+            actions=actions,
+            created_by=update.effective_user.id,
+            cpu_below=float(options['cpu_below']) if options.get('cpu_below') is not None else None,
+            cpu_above=float(options['cpu_above']) if options.get('cpu_above') is not None else None,
+            ram_below=float(options['ram_below']) if options.get('ram_below') is not None else None,
+            ram_above=float(options['ram_above']) if options.get('ram_above') is not None else None,
+            note=note,
+        )
+
+    async def _command_schedule_in(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update):
+            return
+        if len(context.args) < 2:
+            await self._safe_reply(
+                update,
+                'Использование:\n'
+                '<code>/schedulein 20m webcam:15 audio:20 --if-cpu-below 12 --comment Ночная проверка</code>\n'
+                '<code>/schedulein 20m ocrscreen clipboard —comment Проверить экран и буфер</code>\n'
+                '<code>/schedulein 2h shutdown --if-cpu-below 10 --if-ram-below 60 --note Выключить если простаивает</code>',
+                parse_mode=ParseMode.HTML,
+                dismissable=True,
+            )
+            return
+
+        try:
+            job = await self._create_scheduled_job_from_mode(update, 'in', context.args[0], context.args[1:])
+            await self._safe_reply(
+                update,
+                f'✅ <b>Задача создана</b>\n{self._format_scheduled_job(job)}',
+                parse_mode=ParseMode.HTML,
+                dismissable=True,
+            )
+        except PermissionError:
+            return
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка планировщика: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_schedule_at(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update):
+            return
+        if len(context.args) < 2:
+            await self._safe_reply(
+                update,
+                'Использование:\n'
+                '<code>/scheduleat 03:00 reboot --comment Ночной ребут</code>\n'
+                '<code>/scheduleat 03:00 screenshot logsave hwinfo reboot --note Ночной ребут с логами</code>\n'
+                '<code>/scheduleat 06:30 clipboard status --comment Утренний отчёт</code>',
+                parse_mode=ParseMode.HTML,
+                dismissable=True,
+            )
+            return
+
+        try:
+            job = await self._create_scheduled_job_from_mode(update, 'at', context.args[0], context.args[1:])
+            await self._safe_reply(
+                update,
+                f'✅ <b>Задача создана</b>\n{self._format_scheduled_job(job)}',
+                parse_mode=ParseMode.HTML,
+                dismissable=True,
+            )
+        except PermissionError:
+            return
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка планировщика: <code>{html.escape(str(exc))}</code>',
+                                   parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _command_jobs(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update):
+            return
+        text, markup = self._build_scheduler_jobs_view(self._application.bot.username)
+        if update.effective_chat:
+            message = await update.effective_chat.send_message(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+            self._menu_msg_id_by_user[update.effective_user.id] = message.message_id
+            return
+        await self._safe_reply(update, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def _command_jobcancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update):
+            return
+        if not context.args:
+            await self._safe_reply(update, 'Использование: <code>/jobcancel JOB_ID</code>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
+            return
+
+        removed = self._scheduler_store.remove_job(context.args[0].strip())
+        if removed is None:
+            await self._safe_reply(update, '❌ Задача не найдена.', dismissable=True)
+            return
+        await self._safe_reply(update, f'🗑 <b>Задача отменена:</b>\n{self._format_scheduled_job(removed)}',
+                               parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _scheduler_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                due_jobs = self._scheduler_store.pop_due(time.time())
+                for job in due_jobs:
+                    try:
+                        await self._execute_scheduled_job(job)
+                    except Exception as exc:
+                        self.log_message.emit(f'Scheduled job failed {job.job_id}: {exc}')
+                        await self._notify_admins(
+                            f'❌ <b>Планировщик:</b> ошибка задачи <code>{job.job_id}</code>\n<code>{html.escape(str(exc))}</code>'
+                        )
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _execute_scheduled_job(self, job: ScheduledJob) -> None:
+        actions_text = ', '.join(self._format_schedule_action(action) for action in job.actions)
+        note_block = self._format_schedule_note(job.note)
+        cpu_percent: float | None = None
+        if job.cpu_below is not None or job.cpu_above is not None:
+            cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.6)
+        if job.cpu_below is not None:
+            if cpu_percent > job.cpu_below:
+                message = (
+                    f'⏭️ <b>Планировщик:</b> задача <code>{job.job_id}</code> пропущена.\n'
+                    f'CPU сейчас <code>{cpu_percent:.1f}%</code>, порог <code>{job.cpu_below:.1f}%</code>.'
+                )
+                if note_block:
+                    message += note_block
+                self.log_message.emit(message)
+                await self._notify_admins(message)
+                return
+        if job.cpu_above is not None:
+            if cpu_percent < job.cpu_above:
+                message = (
+                    f'⏭️ <b>Планировщик:</b> задача <code>{job.job_id}</code> пропущена.\n'
+                    f'CPU сейчас <code>{cpu_percent:.1f}%</code>, нужен минимум <code>{job.cpu_above:.1f}%</code>.'
+                )
+                if note_block:
+                    message += note_block
+                self.log_message.emit(message)
+                await self._notify_admins(message)
+                return
+        memory_percent: float | None = None
+        if job.ram_below is not None or job.ram_above is not None:
+            memory_percent = psutil.virtual_memory().percent
+        if job.ram_below is not None and memory_percent > job.ram_below:
+            message = (
+                f'⏭️ <b>Планировщик:</b> задача <code>{job.job_id}</code> пропущена.\n'
+                f'RAM сейчас <code>{memory_percent:.1f}%</code>, порог <code>{job.ram_below:.1f}%</code>.'
+            )
+            if note_block:
+                message += note_block
+            self.log_message.emit(message)
+            await self._notify_admins(message)
+            return
+        if job.ram_above is not None and memory_percent < job.ram_above:
+            message = (
+                f'⏭️ <b>Планировщик:</b> задача <code>{job.job_id}</code> пропущена.\n'
+                f'RAM сейчас <code>{memory_percent:.1f}%</code>, нужен минимум <code>{job.ram_above:.1f}%</code>.'
+            )
+            if note_block:
+                message += note_block
+            self.log_message.emit(message)
+            await self._notify_admins(message)
+            return
+
+        start_message = (
+            f'⏰ <b>Планировщик:</b> выполняю задачу <code>{job.job_id}</code>\n'
+            f'Действия: <code>{html.escape(actions_text)}</code>{note_block}'
+        )
+        self.log_message.emit(start_message)
+        status_refs = await self._send_message_to_admins(start_message, reply_markup=self._dismiss_markup())
+        disruptive_actions = {'shutdown', 'reboot', 'hibernate', 'sleep'}
+
+        try:
+            for raw_action in job.actions:
+                action, action_value = self._parse_scheduled_action_spec(raw_action)
+                if action == 'screenshot':
+                    screenshot_bytes, file_name = await asyncio.to_thread(capture_screenshot_bytes)
+                    saved_path = await asyncio.to_thread(self._save_artifact_bytes, file_name, screenshot_bytes)
+                    await self._send_photo_to_admins(
+                        screenshot_bytes,
+                        file_name,
+                        f'🖼 <b>Планировщик:</b> скриншот задачи <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
+                    )
+                    continue
+
+                if action == 'logsave':
+                    saved_path = await asyncio.to_thread(self._save_log_snapshot, job.job_id)
+                    await self._send_document_to_admins(
+                        saved_path.read_bytes(),
+                        saved_path.name,
+                        f'🧾 <b>Планировщик:</b> лог задачи <code>{job.job_id}</code>{note_block}',
+                    )
+                    continue
+
+                if action == 'status':
+                    snapshot = await asyncio.to_thread(
+                        collect_snapshot,
+                        len(self._config_provider().admins),
+                        self._config_provider().autostart,
+                        self._running,
+                    )
+                    status_text = (
+                        f'📊 <b>Планировщик:</b> статус задачи <code>{job.job_id}</code>\n'
+                        f'💻 <b>Хост:</b> <code>{html.escape(snapshot.hostname)}</code>\n'
+                        f'🧠 <b>CPU:</b> <code>{snapshot.cpu_percent:.1f}%</code>\n'
+                        f'💽 <b>RAM:</b> <code>{snapshot.memory_percent:.1f}%</code>\n'
+                        f'💾 <b>Disk:</b> <code>{snapshot.disk_percent:.1f}%</code>\n'
+                        f'⏱ <b>Uptime:</b> <code>{format_uptime(snapshot.uptime_seconds)}</code>{note_block}'
+                    )
+                    await self._notify_admins(status_text)
+                    continue
+
+                if action == 'hwinfo':
+                    hw_text = await asyncio.to_thread(get_hardware_info)
+                    await self._notify_admins(f'🧰 <b>Планировщик:</b> железо задачи <code>{job.job_id}</code>\n{hw_text}{note_block}')
+                    continue
+
+                if action == 'ocrscreen':
+                    screenshot_bytes, _ = await asyncio.to_thread(capture_screenshot_bytes)
+                    ocr_result = await extract_text_from_image_bytes(screenshot_bytes)
+                    ocr_text = self._format_ocr_report(ocr_result, 'экран')
+                    await self._notify_admins(
+                        f'🔎 <b>Планировщик:</b> OCR задачи <code>{job.job_id}</code>\n\n{ocr_text}{note_block}'
+                    )
+                    continue
+
+                if action == 'clipboard':
+                    clip_result = await asyncio.to_thread(get_clipboard)
+                    if clip_result.ok:
+                        clip_body = html.escape(clip_result.message or '')
+                        if len(clip_body) > 3500:
+                            clip_body = clip_body[:3500] + '\n...[ОБРЕЗАНО]...'
+                        clip_text = (
+                            f'📋 <b>Планировщик:</b> буфер обмена задачи <code>{job.job_id}</code>\n\n'
+                            f'<code>{clip_body}</code>{note_block}'
+                        )
+                    else:
+                        clip_text = (
+                            f'❌ <b>Планировщик:</b> не удалось прочитать буфер для задачи <code>{job.job_id}</code>\n'
+                            f'<code>{html.escape(clip_result.message)}</code>{note_block}'
+                        )
+                    await self._notify_admins(clip_text)
+                    continue
+
+                if action == 'webcam':
+                    photo_bytes, file_name = await asyncio.to_thread(capture_webcam_photo)
+                    saved_path = await asyncio.to_thread(self._save_artifact_bytes, file_name, photo_bytes)
+                    await self._send_photo_to_admins(
+                        photo_bytes,
+                        file_name,
+                        f'📸 <b>Планировщик:</b> фото с вебки по задаче <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
+                    )
+                    continue
+
+                if action == 'webcamvid':
+                    duration = action_value or 5
+                    video_bytes, file_name = await asyncio.to_thread(capture_webcam_video, duration)
+                    saved_path = await asyncio.to_thread(self._save_artifact_bytes, file_name, video_bytes)
+                    await self._send_video_to_admins(
+                        video_bytes,
+                        file_name,
+                        f'🎥 <b>Планировщик:</b> видео с вебки {duration}с по задаче <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
+                    )
+                    continue
+
+                if action == 'audio':
+                    duration = action_value or 5
+                    audio_bytes, file_name = await asyncio.to_thread(record_audio, duration)
+                    saved_path = await asyncio.to_thread(self._save_artifact_bytes, file_name, audio_bytes)
+                    await self._send_audio_to_admins(
+                        audio_bytes,
+                        file_name,
+                        f'🎙 <b>Планировщик:</b> аудио {duration}с по задаче <code>{job.job_id}</code>\n<code>{html.escape(saved_path.name)}</code>{note_block}',
+                    )
+                    continue
+
+                if action == 'lock':
+                    result = await asyncio.to_thread(lock_workstation)
+                    self.log_message.emit(result.message)
+                    continue
+
+                if action in disruptive_actions:
+                    final_text = (
+                        f'✅ <b>Планировщик:</b> задача <code>{job.job_id}</code> выполнена.\n'
+                        f'Действия: <code>{html.escape(actions_text)}</code>{note_block}'
+                    )
+                    await self._edit_messages_for_admins(status_refs, final_text, reply_markup=self._dismiss_markup())
+                    await asyncio.sleep(0.5)
+                    if action == 'shutdown':
+                        result = await asyncio.to_thread(schedule_shutdown, 0)
+                    elif action == 'reboot':
+                        result = await asyncio.to_thread(schedule_reboot, 0)
+                    elif action == 'hibernate':
+                        result = await asyncio.to_thread(hibernate_system)
+                    else:
+                        result = await asyncio.to_thread(sleep_system)
+                    self.log_message.emit(result.message)
+                    return
+        except Exception:
+            error_text = f'❌ <b>Планировщик:</b> задача <code>{job.job_id}</code> завершилась ошибкой.{note_block}'
+            await self._edit_messages_for_admins(status_refs, error_text, reply_markup=self._dismiss_markup())
+            raise
+
+        final_text = (
+            f'✅ <b>Планировщик:</b> задача <code>{job.job_id}</code> выполнена.\n'
+            f'Действия: <code>{html.escape(actions_text)}</code>{note_block}'
+        )
+        await self._edit_messages_for_admins(status_refs, final_text, reply_markup=self._dismiss_markup())
+
+    def _save_artifact_bytes(self, file_name: str, payload: bytes) -> Path:
+        target_dir = Path(LOG_FILE).parent / 'scheduled_artifacts'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / file_name
+        target_path.write_bytes(payload)
+        return target_path
+
+    def _save_log_snapshot(self, job_id: str) -> Path:
+        source_path = Path(LOG_FILE)
+        if not source_path.exists():
+            raise RuntimeError('Лог-файл ещё не создан.')
+        target_dir = source_path.parent / 'scheduled_artifacts'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        target_path = target_dir / f'log_{job_id}_{stamp}.log'
+        target_path.write_bytes(source_path.read_bytes())
+        return target_path
+
+    async def _send_message_to_admins(
+            self,
+            text: str,
+            reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> list[tuple[int | str, int]]:
+        application = self._application
+        if application is None:
+            return []
+        sent_refs: list[tuple[int | str, int]] = []
+        for admin_id in self._config_provider().admins.keys():
+            try:
+                message = await application.bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                    read_timeout=60,
+                    write_timeout=60,
+                )
+                sent_refs.append((admin_id, message.message_id))
+            except Exception as exc:
+                self.log_message.emit(f'Failed to send scheduled status to admin {admin_id}: {exc}')
+        return sent_refs
+
+    async def _edit_messages_for_admins(
+            self,
+            refs: list[tuple[int | str, int]],
+            text: str,
+            reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        application = self._application
+        if application is None:
+            return
+        for admin_id, message_id in refs:
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=admin_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                    read_timeout=60,
+                    write_timeout=60,
+                )
+            except Exception as exc:
+                self.log_message.emit(f'Failed to update scheduled status for admin {admin_id}: {exc}')
+
+    async def _send_photo_to_admins(self, payload: bytes, file_name: str, caption: str) -> None:
+        application = self._application
+        if application is None:
+            return
+        for admin_id in self._config_provider().admins.keys():
+            try:
+                await application.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=InputFile(BytesIO(payload), filename=file_name),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._dismiss_markup(),
+                    read_timeout=60,
+                    write_timeout=60,
+                )
+            except Exception as exc:
+                self.log_message.emit(f'Failed to send scheduled photo to admin {admin_id}: {exc}')
+
+    async def _send_video_to_admins(self, payload: bytes, file_name: str, caption: str) -> None:
+        application = self._application
+        if application is None:
+            return
+        for admin_id in self._config_provider().admins.keys():
+            try:
+                await application.bot.send_video(
+                    chat_id=admin_id,
+                    video=InputFile(BytesIO(payload), filename=file_name),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._dismiss_markup(),
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            except Exception as exc:
+                self.log_message.emit(f'Failed to send scheduled video to admin {admin_id}: {exc}')
+
+    async def _send_document_to_admins(self, payload: bytes, file_name: str, caption: str) -> None:
+        application = self._application
+        if application is None:
+            return
+        for admin_id in self._config_provider().admins.keys():
+            try:
+                await application.bot.send_document(
+                    chat_id=admin_id,
+                    document=InputFile(BytesIO(payload), filename=file_name),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._dismiss_markup(),
+                    read_timeout=60,
+                    write_timeout=60,
+                )
+            except Exception as exc:
+                self.log_message.emit(f'Failed to send scheduled document to admin {admin_id}: {exc}')
+
+    async def _send_audio_to_admins(self, payload: bytes, file_name: str, caption: str) -> None:
+        application = self._application
+        if application is None:
+            return
+        for admin_id in self._config_provider().admins.keys():
+            try:
+                await self._send_voice_note(
+                    audio_bytes=payload,
+                    file_name=file_name,
+                    caption=caption,
+                    bot=application.bot,
+                    chat_id=admin_id,
+                    reply_markup=self._dismiss_markup(),
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            except Exception as exc:
+                self.log_message.emit(f'Failed to send scheduled audio to admin {admin_id}: {exc}')
 
     async def _show_autoaccept_menu(self, query) -> None:
         text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
@@ -2342,10 +3724,13 @@ class TelegramBotService(QObject):
 
         if data.startswith('panel:files') and not await self._ensure_admin(update, 'files'): return
         if data.startswith('panel:proc') and not await self._ensure_admin(update, 'process'): return
+        if data.startswith('panel:win') and not await self._ensure_admin(update, 'process'): return
         if (data.startswith('panel:input') or data.startswith('panel:aa')) and not await self._ensure_admin(update,
                                                                                                             'input'): return
+        if data.startswith('panel:cliphist') and not await self._ensure_admin(update, 'input'): return
         if data.startswith('panel:power') and not await self._ensure_admin(update, 'power'): return
         if data.startswith('panel:media') and not await self._ensure_admin(update, 'media'): return
+        if (data.startswith('panel:ocr') or data.startswith('panel:sched')) and not await self._ensure_admin(update): return
 
         # Dismissal
         if data == 'panel:dismiss':
@@ -2370,6 +3755,13 @@ class TelegramBotService(QObject):
             return
         if data == 'panel:input':
             await self._edit_panel_message(query, self._panel_input_text(), self._panel_input_markup())
+            return
+        if data == 'panel:ocr':
+            await self._edit_panel_message(query, self._ocr_menu_text(), self._ocr_menu_markup())
+            return
+        if data == 'panel:sched':
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            await self._edit_panel_message(query, self._scheduler_panel_text(), self._scheduler_panel_markup())
             return
         if data == 'panel:power':
             await self._edit_panel_message(query, self._panel_power_text(), self._panel_power_markup())
@@ -2411,6 +3803,42 @@ class TelegramBotService(QObject):
 
         if data == 'panel:screenshot':
             await self._command_screenshot(update, context)
+            return
+        if data == 'panel:ocr:screen':
+            await self._run_screen_ocr(update, reply_markup=self._ocr_reply_markup())
+            return
+        if data == 'panel:ocr:find':
+            self._pending_action_by_user[update.effective_user.id] = 'ocr_query'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:ocr')]])
+            await self._edit_panel_message(query, '🔎 <b>Отправьте текст для поиска на текущем экране:</b>', markup)
+            return
+
+        if data == 'panel:sched:help':
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            await self._edit_panel_message(query, self._scheduler_help_text(), self._scheduler_help_markup())
+            return
+        if data == 'panel:sched:add':
+            self._pending_action_by_user[update.effective_user.id] = 'schedule_create'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            await self._edit_panel_message(query, self._scheduler_add_text(), self._scheduler_add_markup())
+            return
+        if data == 'panel:sched:list':
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            text, markup = self._build_scheduler_jobs_view(self._application.bot.username)
+            await self._edit_panel_message(query, text, markup)
+            return
+        if data == 'panel:sched:clear':
+            count = self._scheduler_store.clear()
+            await query.answer(f'Удалено задач: {count}', show_alert=False)
+            await self._edit_panel_message(query, self._scheduler_panel_text(), self._scheduler_panel_markup())
+            return
+        if data.startswith('panel:sched:cancel:'):
+            job_id = data.split(':', 3)[-1]
+            removed = self._scheduler_store.remove_job(job_id)
+            await query.answer('Задача отменена.' if removed else 'Задача не найдена.', show_alert=False)
+            text, markup = self._build_scheduler_jobs_view(self._application.bot.username)
+            await self._edit_panel_message(query, text, markup)
             return
 
         # Files
@@ -2523,6 +3951,14 @@ class TelegramBotService(QObject):
                                            '💻 <b>Отправьте команду</b>, которую нужно выполнить в терминале (CMD/PowerShell):',
                                            markup)
             return
+        if data == 'panel:proc:windows':
+            user_id = update.effective_user.id
+            self._menu_msg_id_by_user[user_id] = query.message.message_id
+            bot_username = self._application.bot.username
+            text, total_pages = await asyncio.to_thread(self._build_windows_page, bot_username, 0)
+            markup = self._windows_list_markup(0, total_pages)
+            await self._edit_panel_message(query, text, markup)
+            return
         if data == 'panel:proc:cancel_cmd':
             self._pending_action_by_user.pop(update.effective_user.id, None)
             await self._edit_panel_message(query, self._panel_process_text(), self._panel_process_markup())
@@ -2531,6 +3967,7 @@ class TelegramBotService(QObject):
         if data == 'panel:proc:list':
             user_id = update.effective_user.id
             self._process_filter_by_user[user_id] = ''
+            self._menu_msg_id_by_user[user_id] = query.message.message_id
             try:
                 bot_username = self._application.bot.username
                 text, total_pages = await asyncio.to_thread(self._build_tasklist_page, '', bot_username, 0)
@@ -2542,6 +3979,7 @@ class TelegramBotService(QObject):
         if data.startswith('panel:proc:page:'):
             page = int(data.split(':')[-1])
             user_id = update.effective_user.id
+            self._menu_msg_id_by_user[user_id] = query.message.message_id
             filter_text = self._process_filter_by_user.get(user_id, '')
             try:
                 bot_username = self._application.bot.username
@@ -2551,6 +3989,31 @@ class TelegramBotService(QObject):
                 await self._edit_panel_message(query, text, markup)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+            return
+        if data.startswith('panel:proc:info:'):
+            _, _, _, pid_str, page_str = data.split(':', 4)
+            try:
+                text = await asyncio.to_thread(self._process_detail_text, int(pid_str))
+                markup = self._process_detail_markup(int(pid_str), int(page_str))
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
+            return
+        if data.startswith('panel:proc:kill:'):
+            _, _, _, pid_str, page_str = data.split(':', 4)
+            pid = int(pid_str)
+            page = int(page_str)
+            try:
+                result = await asyncio.to_thread(self._terminate_pid, pid)
+                await query.answer(result[:180], show_alert=False)
+                user_id = update.effective_user.id
+                filter_text = self._process_filter_by_user.get(user_id, '')
+                bot_username = self._application.bot.username
+                text, total_pages = await asyncio.to_thread(self._build_tasklist_page, filter_text, bot_username, page)
+                markup = self._tasklist_markup(page, total_pages)
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
             return
         if data == 'panel:proc:search':
             self._pending_action_by_user[update.effective_user.id] = 'proc_search'
@@ -2685,16 +4148,19 @@ class TelegramBotService(QObject):
         if data == 'panel:input:clip':
             self._pending_action_by_user[update.effective_user.id] = 'clip_set'
             self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton('📥 Получить текущий буфер', callback_data='panel:input:clip_get')],
-                [InlineKeyboardButton('❌ Отменить', callback_data='panel:input:cancel_text')]
-            ])
-            await self._edit_panel_message(query,
-                                           '📋 <b>Отправьте текст</b>, чтобы скопировать его в буфер обмена ПК, или нажмите кнопку ниже для получения текущего текста:',
-                                           markup)
+            text, markup = await self._build_clipboard_panel_view()
+            await self._edit_panel_message(query, text, markup)
             return
         if data == 'panel:input:clip_get':
-            await self._command_clip(update, context)
+            self._pending_action_by_user[update.effective_user.id] = 'clip_set'
+            self._menu_msg_id_by_user[update.effective_user.id] = query.message.message_id
+            text, markup = await self._build_clipboard_panel_view()
+            await self._edit_panel_message(query, text, markup)
+            return
+        if data == 'panel:input:clip_history':
+            self._pending_action_by_user.pop(update.effective_user.id, None)
+            text, markup = self._build_clipboard_history_page(0)
+            await self._edit_panel_message(query, text, markup)
             return
         if data == 'panel:input:cancel_text':
             self._pending_action_by_user.pop(update.effective_user.id, None)
@@ -2765,6 +4231,117 @@ class TelegramBotService(QObject):
         if data == 'panel:input:help':
             markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]])
             await self._edit_panel_message(query, self._panel_input_help_text(), markup)
+            return
+
+        if data.startswith('panel:cliphist:page:'):
+            page = int(data.split(':')[-1])
+            text, markup = self._build_clipboard_history_page(page)
+            await self._edit_panel_message(query, text, markup)
+            return
+        if data.startswith('panel:cliphist:view:'):
+            _, _, _, entry_id, page_str = data.split(':', 4)
+            text, markup = self._build_clipboard_entry_view(entry_id, int(page_str))
+            await self._edit_panel_message(query, text, markup)
+            return
+        if data.startswith('panel:cliphist:restore:'):
+            _, _, _, entry_id, page_str = data.split(':', 4)
+            entry = self._clipboard_history.get(entry_id)
+            if entry is None:
+                await query.answer('Элемент истории не найден.', show_alert=False)
+            else:
+                result = await asyncio.to_thread(set_clipboard, entry.text)
+                if result.ok:
+                    self._clipboard_history.add_text(entry.text)
+                await query.answer(result.message[:180], show_alert=False)
+            text, markup = self._build_clipboard_entry_view(entry_id, int(page_str))
+            await self._edit_panel_message(query, text, markup)
+            return
+
+        if data.startswith('panel:win:page:'):
+            page = int(data.split(':')[-1])
+            user_id = update.effective_user.id
+            self._menu_msg_id_by_user[user_id] = query.message.message_id
+            bot_username = self._application.bot.username
+            text, total_pages = await asyncio.to_thread(self._build_windows_page, bot_username, page)
+            markup = self._windows_list_markup(page, total_pages)
+            await self._edit_panel_message(query, text, markup)
+            return
+        if data.startswith('panel:win:view:'):
+            _, _, _, hwnd_str, page_str = data.split(':', 4)
+            try:
+                text = await asyncio.to_thread(self._window_detail_text, int(hwnd_str))
+                markup = self._window_detail_markup(int(hwnd_str), int(page_str))
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
+            return
+        if data.startswith('panel:win:activate:'):
+            _, _, _, hwnd_str, page_str = data.split(':', 4)
+            try:
+                result = await asyncio.to_thread(activate_window, int(hwnd_str))
+                await query.answer(result.message[:180], show_alert=False)
+                text = await asyncio.to_thread(self._window_detail_text, int(hwnd_str))
+                markup = self._window_detail_markup(int(hwnd_str), int(page_str))
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
+            return
+        if data.startswith('panel:win:minimize:'):
+            _, _, _, hwnd_str, page_str = data.split(':', 4)
+            try:
+                result = await asyncio.to_thread(minimize_window, int(hwnd_str))
+                await query.answer(result.message[:180], show_alert=False)
+                text = await asyncio.to_thread(self._window_detail_text, int(hwnd_str))
+                markup = self._window_detail_markup(int(hwnd_str), int(page_str))
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
+            return
+        if data.startswith('panel:win:close:'):
+            _, _, _, hwnd_str, page_str = data.split(':', 4)
+            try:
+                result = await asyncio.to_thread(close_window, int(hwnd_str))
+                await query.answer(result.message[:180], show_alert=False)
+                bot_username = self._application.bot.username
+                text, total_pages = await asyncio.to_thread(self._build_windows_page, bot_username, int(page_str))
+                markup = self._windows_list_markup(int(page_str), total_pages)
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
+            return
+        if data.startswith('panel:win:screenshot:'):
+            _, _, _, hwnd_str, page_str = data.split(':', 4)
+            hwnd = int(hwnd_str)
+            page = int(page_str)
+            try:
+                await query.edit_message_text('⏳ <b>Делаю скрин окна...</b>', parse_mode=ParseMode.HTML)
+                image_bytes, file_name = await asyncio.to_thread(capture_window_bytes_for_window, hwnd)
+                await query.edit_message_text('⏳ <b>Отправка...</b>', parse_mode=ParseMode.HTML)
+                if update.effective_chat:
+                    await update.effective_chat.send_photo(
+                        photo=InputFile(BytesIO(image_bytes), filename=file_name),
+                        caption=f'🪟 <b>Скрин окна</b>\n<code>{html.escape(file_name)}</code>',
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._close_markup(),
+                        read_timeout=60,
+                        write_timeout=60,
+                    )
+                await query.answer('Скрин окна отправлен.', show_alert=False)
+                text = await asyncio.to_thread(self._window_detail_text, hwnd)
+                markup = self._window_detail_markup(hwnd, page)
+                await self._edit_panel_message(query, text, markup)
+            except Exception as exc:
+                await query.answer(str(exc), show_alert=True)
+                try:
+                    text = await asyncio.to_thread(self._window_detail_text, hwnd)
+                    markup = self._window_detail_markup(hwnd, page)
+                    await self._edit_panel_message(query, text, markup)
+                except Exception:
+                    pass
+            return
+        if data.startswith('panel:win:ocr:'):
+            _, _, _, hwnd_str, page_str = data.split(':', 4)
+            await self._run_window_ocr(update, int(hwnd_str), int(page_str))
             return
 
         # Power
@@ -3199,6 +4776,8 @@ class TelegramBotService(QObject):
              InlineKeyboardButton('⌨️ Ввод', callback_data='panel:input')],
             [InlineKeyboardButton('🔋 Питание', callback_data='panel:power'),
              InlineKeyboardButton('🎥 Медиа', callback_data='panel:media')],
+            [InlineKeyboardButton('🔎 OCR', callback_data='panel:ocr'),
+             InlineKeyboardButton('🗓 Планировщик', callback_data='panel:sched')],
             [InlineKeyboardButton('🧾 Логи', callback_data='panel:logs'),
              InlineKeyboardButton('❓ Помощь', callback_data='panel:help')],
             [InlineKeyboardButton('🖼 Скриншот', callback_data='panel:screenshot')]
@@ -3220,7 +4799,7 @@ class TelegramBotService(QObject):
 
     @staticmethod
     def _panel_process_text() -> str:
-        return '⚙️ <b>Система и Процессы</b>\n\nУправление процессами и доступ к системному терминалу.'
+        return '⚙️ <b>Система и Процессы</b>\n\nУправление процессами, живыми окнами и доступ к системному терминалу.'
 
     @staticmethod
     def _panel_process_markup() -> InlineKeyboardMarkup:
@@ -3228,18 +4807,20 @@ class TelegramBotService(QObject):
             [InlineKeyboardButton('📋 Все процессы', callback_data='panel:proc:list')],
             [InlineKeyboardButton('🔎 Поиск процесса', callback_data='panel:proc:search')],
             [InlineKeyboardButton('💻 Терминал (CMD)', callback_data='panel:proc:cmd')],
+            [InlineKeyboardButton('🪟 Живые окна', callback_data='panel:proc:windows')],
             [InlineKeyboardButton('🌡 Датчики и Железо', callback_data='panel:proc:hw')],
             [InlineKeyboardButton('⬅️ Назад', callback_data='panel:main')]
         ])
 
     @staticmethod
     def _tasklist_markup(page: int, total_pages: int) -> InlineKeyboardMarkup:
+        safe_page = max(0, min(page, max(total_pages - 1, 0)))
         buttons = []
         nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton('⬅️ Вверх', callback_data=f'panel:proc:page:{page - 1}'))
-        if page < total_pages - 1:
-            nav_row.append(InlineKeyboardButton('Вниз ➡️', callback_data=f'panel:proc:page:{page + 1}'))
+        if safe_page > 0:
+            nav_row.append(InlineKeyboardButton('⬅️ Вверх', callback_data=f'panel:proc:page:{safe_page - 1}'))
+        if safe_page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton('Вниз ➡️', callback_data=f'panel:proc:page:{safe_page + 1}'))
 
         if nav_row:
             buttons.append(nav_row)
@@ -3249,7 +4830,7 @@ class TelegramBotService(QObject):
 
     @staticmethod
     def _panel_input_text() -> str:
-        return '⌨️ <b>Ввод и управление</b>\n\nЭмуляция нажатий, управление мышью, буфер обмена и макросы.'
+        return '⌨️ <b>Ввод и управление</b>\n\nЭмуляция нажатий, управление мышью, буфер обмена, OCR и макросы.'
 
     @staticmethod
     def _panel_reminders_text() -> str:
@@ -3337,9 +4918,16 @@ class TelegramBotService(QObject):
             '<code>/remind HH:MM &lt;text&gt;</code>\n'
             '<code>/voice &lt;text&gt;</code>\n'
             '<code>/clip [text]</code>\n'
+            '<code>/cliphistory</code>\n'
+            '<code>/ocr [query]</code>\n'
             '<code>/antiafkon</code> <code>/antiafkoff</code>\n'
             '<code>/autoaccepton [timeout]</code>\n'
-            '<code>/autoacceptoff</code>'
+            '<code>/autoacceptoff</code>\n'
+            '<code>/schedulein 20m webcam:15 audio:20 --if-cpu-below 12 --comment Ночная проверка</code>\n'
+            '<code>/schedulein 20m ocrscreen clipboard —comment Проверить экран и буфер</code>\n'
+            '<code>/schedulein 2h shutdown --if-cpu-below 10 --if-ram-below 60 --note Выключить если простаивает</code>\n'
+            '<code>/scheduleat 03:00 screenshot logsave reboot --comment Ночной ребут</code>\n'
+            '<code>/jobs</code> <code>/jobcancel JOB_ID</code>'
         )
 
     @staticmethod
@@ -3383,10 +4971,12 @@ class TelegramBotService(QObject):
             '❓ <b>Помощь по панели:</b>\n'
             '• Обзор — статус, аптайм, ping, скриншот.\n'
             '• Файлы — текущая папка, список файлов, upload.\n'
-            '• Процессы — список процессов, терминал.\n'
-            '• Ввод — горячие клавиши, мышь, макросы.\n'
+            '• Процессы — список процессов, терминал, живые окна.\n'
+            '• Ввод — горячие клавиши, мышь, макросы, буфер.\n'
             '• Медиа — фото, видео, аудио.\n'
             '• Питание — lock, sleep, hibernate, выключение.\n'
+            '• OCR — распознавание текста и поиск по экрану.\n'
+            '• Планировщик — быстрые пресеты, список и отмена задач.\n'
             '• Логи — чтение файла логов.\n\n'
             'Полный список команд также доступен через /help'
         )
@@ -3565,6 +5155,10 @@ class TelegramBotService(QObject):
     def _run_in_thread(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        try:
+            self._clipboard_history.start()
+        except Exception as exc:
+            self.log_message.emit(f'Clipboard history disabled: {exc}')
 
         while not self._stop_event.is_set():
             try:
@@ -3583,6 +5177,7 @@ class TelegramBotService(QObject):
 
         self._running = False
         self.state_changed.emit(False)
+        self._clipboard_history.stop()
         if self._loop and self._loop.is_running():
             self._loop.stop()
         if self._loop:
@@ -3601,6 +5196,8 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('status', self._command_status))
         self._application.add_handler(CommandHandler('uptime', self._command_uptime))
         self._application.add_handler(CommandHandler('screenshot', self._command_screenshot))
+        self._application.add_handler(CommandHandler('ocr', self._command_ocr))
+        self._application.add_handler(CommandHandler('windows', self._command_windows))
         self._application.add_handler(CommandHandler('stream', self._command_stream))
         self._application.add_handler(CommandHandler('stopstream', self._command_stopstream))
         self._application.add_handler(CommandHandler('report', self._command_report))
@@ -3644,8 +5241,13 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('voice', self._command_voice))
         self._application.add_handler(CommandHandler('say', self._command_voice))
         self._application.add_handler(CommandHandler('clip', self._command_clip))
+        self._application.add_handler(CommandHandler('cliphistory', self._command_clip_history))
         self._application.add_handler(CommandHandler('antiafkon', self._command_antiafk_on))
         self._application.add_handler(CommandHandler('antiafkoff', self._command_antiafk_off))
+        self._application.add_handler(CommandHandler('schedulein', self._command_schedule_in))
+        self._application.add_handler(CommandHandler('scheduleat', self._command_schedule_at))
+        self._application.add_handler(CommandHandler('jobs', self._command_jobs))
+        self._application.add_handler(CommandHandler('jobcancel', self._command_jobcancel))
         self._application.add_handler(CommandHandler('leftclick', self._command_leftclick))
         self._application.add_handler(CommandHandler('rightclick', self._command_rightclick))
         self._application.add_handler(CommandHandler('leftdoubleclick', self._command_leftdoubleclick))
@@ -3671,6 +5273,7 @@ class TelegramBotService(QObject):
         self._running = True
         self.state_changed.emit(True)
         self.log_message.emit('Bot started successfully.')
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
         try:
             import socket, platform
@@ -3738,6 +5341,13 @@ class TelegramBotService(QObject):
             self.log_message.emit('Очистка соединений...')
             if self._hibernate_task and not self._hibernate_task.done():
                 self._hibernate_task.cancel()
+            if self._scheduler_task and not self._scheduler_task.done():
+                self._scheduler_task.cancel()
+                try:
+                    await self._scheduler_task
+                except asyncio.CancelledError:
+                    pass
+                self._scheduler_task = None
 
             try:
                 # ОЧЕНЬ ВАЖНО: Оборачиваем остановку в wait_for.
@@ -3956,8 +5566,10 @@ class TelegramBotService(QObject):
 
         for pid, name, memory_mb in page_records:
             link_kill = f'https://t.me/{bot_username}?start=kill_{pid}'
+            link_info = f'https://t.me/{bot_username}?start=proc_{pid}_{page}'
             lines.append(
-                f'<a href="{link_kill}">❌</a> | <code>{memory_mb:>6.1f} MB</code> | <code>{html.escape(name)}</code>')
+                f'<a href="{link_kill}">❌</a> | <code>{memory_mb:>6.1f} MB</code> | '
+                f'<a href="{link_info}">{html.escape(name)}</a> <code>[PID {pid}]</code>')
 
         lines.append(f'\nВсего найдено: {len(records)}')
         return '\n'.join(lines), total_pages

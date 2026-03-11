@@ -358,6 +358,7 @@ def record_audio(duration_seconds: int = 5) -> tuple[bytes, str]:
 def get_hardware_info() -> str:
     lines = []
     procs = []
+    ignored_cpu_process_names = {'system idle process', 'idle'}
     for p in psutil.process_iter(['name', 'memory_info']):
         try:
             p.cpu_percent(interval=None)
@@ -373,13 +374,15 @@ def get_hardware_info() -> str:
     for p in procs:
         try:
             c = p.cpu_percent(interval=None)
-            if c > top_cpu_val:
+            process_name = str(p.info.get('name') or 'unknown')
+            is_idle_process = p.pid == 0 or process_name.strip().lower() in ignored_cpu_process_names
+            if not is_idle_process and c > top_cpu_val:
                 top_cpu_val = c
-                top_cpu_name = p.info['name']
+                top_cpu_name = process_name
             m = p.info['memory_info'].rss if p.info['memory_info'] else 0
             if m > top_ram_val:
                 top_ram_val = m
-                top_ram_name = p.info['name']
+                top_ram_name = process_name
         except:
             pass
 

@@ -1,8 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_submodules
 
 datas = []
 binaries = []
-hiddenimports = []
+hiddenimports = collect_submodules('winsdk')
 
 
 a = Analysis(
