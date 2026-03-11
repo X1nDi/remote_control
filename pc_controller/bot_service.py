@@ -3177,8 +3177,7 @@ class TelegramBotService(QObject):
     @staticmethod
     def _power_reply_markup() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton('⬅️ Назад в Питание', callback_data='panel:power'),
-             InlineKeyboardButton('👌 Закрыть', callback_data='panel:dismiss')]
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:power')]
         ])
 
     @staticmethod
