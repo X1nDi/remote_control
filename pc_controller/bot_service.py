@@ -1076,14 +1076,23 @@ class TelegramBotService(QObject):
             return
 
         try:
+            cancelled_hibernate = False
             if self._hibernate_task and not self._hibernate_task.done():
                 self._hibernate_task.cancel()
                 self._hibernate_task = None
+                cancelled_hibernate = True
 
             result = await asyncio.to_thread(cancel_scheduled_power_action)
-            self.log_message.emit(result.message)
+            if result.code == 'not_pending':
+                message = 'Таймер гибернации отменён.' if cancelled_hibernate else 'Нечего отменять: отложенное выключение или ребут не были запланированы.'
+            elif cancelled_hibernate:
+                message = 'Отложенное выключение/ребут и таймер гибернации отменены.'
+            else:
+                message = result.message
+
+            self.log_message.emit(message)
             await self._safe_reply(update,
-                                   f'✋ <b>{html.escape(result.message)}</b> (Включая отмену таймера гибернации)',
+                                   f'✋ <b>{html.escape(message)}</b>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
         except Exception as exc:
             self.log_message.emit(f'Cancel shutdown command failed: {exc}')
@@ -2876,11 +2885,6 @@ class TelegramBotService(QObject):
         await self._safe_reply(update, '❌ Неизвестное действие панели.', dismissable=True, as_toast=True)
 
     async def _execute_power_action(self, update: Update, action: str, delay: int) -> None:
-        if not self._config_provider().allow_power_commands:
-            await self._safe_reply(update, '❌ Управление питанием отключено в настройках.', dismissable=True,
-                                   as_toast=True)
-            return
-
         try:
             if action == 'shutdown':
                 result = await asyncio.to_thread(schedule_shutdown, delay)

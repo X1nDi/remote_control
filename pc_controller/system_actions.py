@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 class CommandResult:
     ok: bool
     message: str
+    code: str = ''
 
 
 def parse_delay(raw_value: str | None, default_seconds: int = 30) -> int:
@@ -46,8 +47,14 @@ def schedule_reboot(seconds: int = 30) -> CommandResult:
 
 def cancel_scheduled_power_action() -> CommandResult:
     _ensure_windows()
-    subprocess.run(['shutdown', '/a'], check=True, capture_output=True, text=True)
-    return CommandResult(True, 'Scheduled power action cancelled.')
+    try:
+        subprocess.run(['shutdown', '/a'], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        # Windows returns 1116 when there is nothing to abort.
+        if exc.returncode == 1116:
+            return CommandResult(True, 'No scheduled shutdown/reboot was pending.', code='not_pending')
+        raise
+    return CommandResult(True, 'Scheduled power action cancelled.', code='cancelled')
 
 
 def lock_workstation() -> CommandResult:
