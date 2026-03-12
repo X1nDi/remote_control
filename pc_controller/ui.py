@@ -769,6 +769,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel('Bot token'))
         layout.addLayout(token_row)
 
+        self.telegram_proxy_edit = QLineEdit()
+        self.telegram_proxy_edit.setPlaceholderText('Опционально: socks5://127.0.0.1:1080 или http://127.0.0.1:8080')
+        self.telegram_proxy_edit.textChanged.connect(self._schedule_save)
+        layout.addWidget(QLabel('Telegram proxy'))
+        layout.addWidget(self.telegram_proxy_edit)
+
+        proxy_hint = QLabel('Если Telegram без VPN отваливается у провайдера, задайте HTTP/SOCKS proxy здесь. Для применения нужен перезапуск бота.')
+        proxy_hint.setWordWrap(True)
+        proxy_hint.setObjectName('Muted')
+        layout.addWidget(proxy_hint)
+
         files_form = QFormLayout()
         files_form.setHorizontalSpacing(16)
         files_form.setVerticalSpacing(12)
@@ -1388,6 +1399,7 @@ class MainWindow(QMainWindow):
         self._loading_config = True
         try:
             self.token_edit.setText(self._config.bot_token)
+            self.telegram_proxy_edit.setText(self._config.telegram_proxy)
 
             self.autostart_checkbox.set_checked_silent(self._config.autostart)
             self.start_minimized_checkbox.set_checked_silent(self._config.start_minimized)
@@ -1456,6 +1468,7 @@ class MainWindow(QMainWindow):
 
     def _save_settings_immediate(self) -> None:
         self._config.bot_token = self.token_edit.text().strip()
+        self._config.telegram_proxy = self.telegram_proxy_edit.text().strip()
         self._config.admins = self._current_admins_data
         self._config.autostart = self.autostart_checkbox.isChecked()
         self._config.start_minimized = self.start_minimized_checkbox.isChecked()

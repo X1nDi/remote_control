@@ -4921,6 +4921,21 @@ class TelegramBotService(QObject):
         if last_error is not None:
             raise last_error
 
+    async def _probe_telegram_api(self) -> None:
+        application = self._application
+        if application is None:
+            raise RuntimeError('Telegram application is not initialized.')
+        await application.bot.get_webhook_info(
+            read_timeout=15,
+            write_timeout=15,
+            connect_timeout=10,
+        )
+
+    def _handle_polling_error(self, error: Exception) -> None:
+        message = f'Telegram polling error: {error}'
+        self._record_runtime_error(message)
+        self.log_message.emit(f'⚠️ {message}')
+
     async def _send_live_stream_frame(
         self,
         chat,
@@ -5499,7 +5514,27 @@ class TelegramBotService(QObject):
 
     async def _runner(self) -> None:
         config = self._config_provider()
-        self._application = ApplicationBuilder().token(config.bot_token.strip()).build()
+        proxy_url = str(getattr(config, 'telegram_proxy', '') or '').strip()
+        builder = (
+            ApplicationBuilder()
+            .token(config.bot_token.strip())
+            .connect_timeout(20)
+            .read_timeout(30)
+            .write_timeout(30)
+            .pool_timeout(15)
+            .connection_pool_size(16)
+            .get_updates_connect_timeout(20)
+            .get_updates_read_timeout(30)
+            .get_updates_write_timeout(30)
+            .get_updates_pool_timeout(15)
+            .get_updates_connection_pool_size(8)
+        )
+        if proxy_url:
+            if proxy_url.lower().startswith('socks'):
+                import socksio  # noqa: F401
+            builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+            self.log_message.emit('Telegram proxy enabled for bot session.')
+        self._application = builder.build()
         self._application.add_handler(CommandHandler('start', self._command_start))
         self._application.add_handler(CommandHandler('help', self._command_help))
         self._application.add_handler(CommandHandler('panel', self._command_panel))
@@ -5577,10 +5612,16 @@ class TelegramBotService(QObject):
         self._application.add_error_handler(self._error_handler)
 
         await self._application.initialize()
+        await self._probe_telegram_api()
         await self._application.start()
         if self._application.updater is None:
             raise RuntimeError('Telegram updater is not available.')
-        await self._application.updater.start_polling(drop_pending_updates=True)
+        await self._application.updater.start_polling(
+            drop_pending_updates=True,
+            timeout=20,
+            bootstrap_retries=0,
+            error_callback=self._handle_polling_error,
+        )
 
         self._running = True
         self.state_changed.emit(True)
@@ -5616,7 +5657,9 @@ class TelegramBotService(QObject):
         try:
             last_tick = time.time()
             last_net_check = time.time()
+            last_api_check = time.time()
             network_fails = 0
+            api_failures = 0
 
             while not self._stop_event.is_set():
                 if self._application and self._application.updater:
@@ -5651,6 +5694,19 @@ class TelegramBotService(QObject):
                         self._record_runtime_error('Смена VPN или обрыв интернета. Принудительный рестарт сетевой сессии.')
                         self.log_message.emit('🌐 Смена VPN или обрыв интернета! Принудительный рестарт...')
                         break
+
+                if now - last_api_check > 20.0:
+                    last_api_check = now
+                    try:
+                        await asyncio.wait_for(self._probe_telegram_api(), timeout=20.0)
+                        api_failures = 0
+                    except Exception as exc:
+                        api_failures += 1
+                        self._record_runtime_error(f'Telegram API health-check failed: {exc}')
+                        self.log_message.emit(f'⚠️ Telegram API health-check failed {api_failures}/2: {exc}')
+                        if api_failures >= 2:
+                            self.log_message.emit('🔄 Telegram API завис или потерял маршрут. Перезапускаю сессию...')
+                            break
         finally:
             self.log_message.emit('Очистка соединений...')
             if self._hibernate_task and not self._hibernate_task.done():

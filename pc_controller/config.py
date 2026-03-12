@@ -44,6 +44,7 @@ class AdminPerms:
 @dataclass(slots=True)
 class AppConfig:
     bot_token: str = ''
+    telegram_proxy: str = ''
     admins: dict[str, AdminPerms] = field(default_factory=dict)
     autostart: bool = False
     start_minimized: bool = True
@@ -71,6 +72,7 @@ class AppConfig:
 
         return cls(
             bot_token=str(data.get('bot_token', '') or '').strip(),
+            telegram_proxy=str(data.get('telegram_proxy', '') or '').strip(),
             admins=parsed_admins,
             autostart=bool(data.get('autostart', False)),
             start_minimized=bool(data.get('start_minimized', True)),
