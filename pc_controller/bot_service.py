@@ -248,7 +248,6 @@ class TelegramBotService(QObject):
         self._timer_targets: dict[str, float] = {}  # Хранит точное время завершения таймеров
         self._timer_counter = 0
         self._overlay_pause_until = 0.0
-        self._resume_notification_pending = False
         self._startup_state_path = Path(tempfile.gettempdir()) / 'pc_controller_startup_state.json'
         self._last_notified_boot_time = self._load_last_notified_boot_time()
         self._runtime_lock = threading.Lock()
@@ -5634,16 +5633,7 @@ class TelegramBotService(QObject):
             hostname = socket.gethostname()
             os_name = platform.system()
             boot_time = float(psutil.boot_time())
-            if self._resume_notification_pending:
-                resume_msg = (
-                    f'🌙 <b>ПК вышел из сна/гибернации!</b>\n'
-                    f'💻 Имя: <code>{html.escape(hostname)}</code> ({html.escape(os_name)})\n'
-                    f'🤖 Бот снова на связи.'
-                )
-                await self._notify_admins(resume_msg)
-                self._resume_notification_pending = False
-                self._save_last_notified_boot_time(boot_time)
-            elif self._should_send_boot_notification(boot_time):
+            if self._should_send_boot_notification(boot_time):
                 startup_msg = (
                     f'🚀 <b>ПК Включен!</b>\n'
                     f'💻 Имя: <code>{html.escape(hostname)}</code> ({html.escape(os_name)})\n'
@@ -5655,10 +5645,7 @@ class TelegramBotService(QObject):
             self.log_message.emit(f'Failed to send startup notification: {notify_exc}')
 
         try:
-            last_tick = time.time()
-            last_net_check = time.time()
             last_api_check = time.time()
-            network_fails = 0
             api_failures = 0
 
             while not self._stop_event.is_set():
@@ -5670,35 +5657,10 @@ class TelegramBotService(QObject):
                 await asyncio.sleep(0.5)
                 now = time.time()
 
-                # --- Детектор выхода из сна / гибернации ---
-                if now - last_tick > 15.0:
-                    self._resume_notification_pending = True
-                    self.log_message.emit('⏳ Выход из сна! Сбрасываю сетевые соединения...')
-                    break
-                last_tick = now
-
-                # --- Активный детектор смены сети / VPN ---
-                if now - last_net_check > 5.0:
-                    last_net_check = now
-                    try:
-                        # Делаем сверхбыстрый "стук" в сервер Telegram для проверки маршрута
-                        fut = asyncio.open_connection('api.telegram.org', 443)
-                        reader, writer = await asyncio.wait_for(fut, timeout=2.0)
-                        writer.close()
-                        await writer.wait_closed()
-                        network_fails = 0
-                    except Exception:
-                        network_fails += 1
-
-                    if network_fails >= 3:  # 15 секунд сеть мертва
-                        self._record_runtime_error('Смена VPN или обрыв интернета. Принудительный рестарт сетевой сессии.')
-                        self.log_message.emit('🌐 Смена VPN или обрыв интернета! Принудительный рестарт...')
-                        break
-
-                if now - last_api_check > 20.0:
+                if now - last_api_check > 15.0:
                     last_api_check = now
                     try:
-                        await asyncio.wait_for(self._probe_telegram_api(), timeout=20.0)
+                        await asyncio.wait_for(self._probe_telegram_api(), timeout=15.0)
                         api_failures = 0
                     except Exception as exc:
                         api_failures += 1
