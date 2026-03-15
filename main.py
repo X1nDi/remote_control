@@ -39,7 +39,10 @@ def main() -> int:
 
     logger = setup_logging()
     config_manager = ConfigManager()
-    bot_service = TelegramBotService(config_provider=config_manager.current)
+    bot_service = TelegramBotService(
+        config_provider=config_manager.current,
+        config_saver=config_manager.save,
+    )
 
     # Сворачиваем в трей ТОЛЬКО если программа запущена Windows с флагом --minimized
     start_minimized = args.minimized

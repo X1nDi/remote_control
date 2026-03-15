@@ -153,7 +153,7 @@ def stop_anti_afk() -> CommandResult:
 class AutoAcceptConfig:
     template_dir: Path
     interval_seconds: float = 1.0
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 600.0
     confidence: float = 0.85
 
 class AutoAcceptService:

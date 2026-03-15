@@ -52,6 +52,7 @@ class AppConfig:
     allow_all_files: bool = False
     files_root: str = field(default_factory=lambda: str(Path.home()))
     autoaccept_templates_dir: str = field(default_factory=lambda: str(APP_DIR / 'autoaccept_templates'))
+    autoaccept_timeout_seconds: int = 600
     show_notifications: bool = True
     installed: bool = False
 
@@ -81,6 +82,7 @@ class AppConfig:
             files_root=str(data.get('files_root', str(Path.home()))),
             autoaccept_templates_dir=str(
                 data.get('autoaccept_templates_dir', '') or str(APP_DIR / 'autoaccept_templates')).strip(),
+            autoaccept_timeout_seconds=max(10, min(int(data.get('autoaccept_timeout_seconds', 600) or 600), 3600)),
             show_notifications=bool(data.get('show_notifications', True)),
             installed=bool(data.get('installed', False)),
         )

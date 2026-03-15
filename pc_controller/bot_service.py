@@ -215,9 +215,14 @@ class TelegramBotService(QObject):
     overlay_show_signal = Signal(str, str, bool) # Добавили 3 аргумент: force_show
     overlay_hide_signal = Signal()
 
-    def __init__(self, config_provider: Callable[[], AppConfig]) -> None:
+    def __init__(
+            self,
+            config_provider: Callable[[], AppConfig],
+            config_saver: Callable[[AppConfig], AppConfig] | None = None,
+    ) -> None:
         super().__init__()
         self._config_provider = config_provider
+        self._config_saver = config_saver
 
         self.overlay_show_signal.connect(self._do_show_overlay)
         self.overlay_hide_signal.connect(self._do_hide_overlay)
@@ -233,6 +238,8 @@ class TelegramBotService(QObject):
         self._pending_action_by_user: dict[int, str] = {}
         self._process_filter_by_user: dict[int, str] = {}
         self._pending_rename_by_user: dict[int, Path] = {}
+        self._aa_upload_msg_id_by_user: dict[int, int] = {}
+        self._aa_list_msg_id_by_user: dict[int, int] = {}
         self._aa_menu_messages: dict[int, int] = {}
         self._menu_msg_id_by_user: dict[int, int] = {}
         self._media_menu_msg_id_by_user: dict[int, int] = {}
@@ -323,6 +330,37 @@ class TelegramBotService(QObject):
         snapshot['running'] = self._running
         snapshot['scheduler_jobs'] = len(self._scheduler_store.list_jobs())
         return snapshot
+
+    @staticmethod
+    def _normalize_autoaccept_timeout(timeout: int) -> int:
+        return max(10, min(int(timeout), 3600))
+
+    def _current_autoaccept_timeout(self) -> int:
+        config = self._config_provider()
+        value = getattr(config, 'autoaccept_timeout_seconds', 600) or 600
+        return self._normalize_autoaccept_timeout(value)
+
+    @staticmethod
+    def _format_autoaccept_timeout(timeout: int) -> str:
+        timeout = int(timeout)
+        if timeout % 3600 == 0:
+            hours = timeout // 3600
+            return f'{hours} ч'
+        if timeout % 60 == 0:
+            minutes = timeout // 60
+            return f'{minutes} мин'
+        return f'{timeout} сек'
+
+    def _set_autoaccept_timeout(self, timeout: int) -> int:
+        normalized = self._normalize_autoaccept_timeout(timeout)
+        config = self._config_provider()
+        config.autoaccept_timeout_seconds = normalized
+        if self._config_saver is not None:
+            try:
+                self._config_saver(config)
+            except Exception as exc:
+                self.log_message.emit(f'Failed to save AutoAccept timeout: {exc}')
+        return normalized
 
     def start(self) -> None:
         if self._running:
@@ -422,6 +460,7 @@ class TelegramBotService(QObject):
                     target = self._autoaccept_template_dir() / filename
                     if target.exists() and target.is_file():
                         target.unlink()
+                        await self._refresh_aa_listing_message(update.effective_user.id)
                         await self._safe_reply(update, f'🗑 Шаблон <b>{html.escape(filename)}</b> удален.',
                                                parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
                     else:
@@ -683,10 +722,7 @@ class TelegramBotService(QObject):
             if thumb_bytes:
                 # В ТГ нельзя поменять текст на фото. Поэтому старое меню удаляем и кидаем фото с кнопкой Назад.
                 if query:
-                    try:
-                        await query.message.delete()
-                    except:
-                        pass
+                    await self._delete_message_safe(query.message)
                 if temp_msg:
                     await self._delete_message_safe(temp_msg)
 
@@ -1048,7 +1084,7 @@ class TelegramBotService(QObject):
                 if first_frame:
                     if query and query.message:
                         self._clear_media_menu_tracking(update.effective_user.id, query.message.message_id)
-                        await query.message.delete()
+                        await self._delete_message_safe(query.message)
                     elif temp_msg:
                         await self._delete_message_safe(temp_msg)
 
@@ -1564,8 +1600,46 @@ class TelegramBotService(QObject):
             return
 
         user_id = update.effective_user.id
+        pending_template = self._pending_rename_by_user.pop(user_id, None)
+        if pending_template and pending_template.exists():
+            try:
+                pending_template.unlink()
+            except Exception:
+                pass
+        if pending_template is not None and user_id not in self._pending_upload_by_user:
+            aa_msg_id = self._aa_upload_msg_id_by_user.pop(user_id, None)
+            if aa_msg_id and self._application:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=aa_msg_id,
+                        text=self._autoaccept_menu_text(),
+                        reply_markup=self._autoaccept_menu_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    self._aa_menu_messages[user_id] = aa_msg_id
+                    return
+                except Exception:
+                    pass
+            await self._safe_reply(update, '✋ <b>Загрузка шаблона отменена.</b>', parse_mode=ParseMode.HTML,
+                                   dismissable=True)
+            return
         if user_id in self._pending_upload_by_user:
             self._pending_upload_by_user.pop(user_id, None)
+            aa_msg_id = self._aa_upload_msg_id_by_user.pop(user_id, None)
+            if aa_msg_id and self._application:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=aa_msg_id,
+                        text=self._autoaccept_menu_text(),
+                        reply_markup=self._autoaccept_menu_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    self._aa_menu_messages[user_id] = aa_msg_id
+                    return
+                except Exception:
+                    pass
             await self._safe_reply(update, '✋ <b>Режим загрузки файла отменен.</b>', parse_mode=ParseMode.HTML,
                                    dismissable=True)
             return
@@ -1622,9 +1696,23 @@ class TelegramBotService(QObject):
 
             if is_aa_dir:
                 self._pending_rename_by_user[user_id] = destination
-                await self._safe_reply(update,
-                                       f'📸 Фото загружено.\n✏️ <b>Отправьте ответным сообщением название для шаблона</b> (например, <code>accept_btn</code>):',
-                                       parse_mode=ParseMode.HTML)
+                upload_msg_id = self._aa_upload_msg_id_by_user.get(user_id)
+                if upload_msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=upload_msg_id,
+                            text=self._aa_upload_text(awaiting_name=True),
+                            reply_markup=self._aa_upload_markup(),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        await self._safe_reply(update, self._aa_upload_text(awaiting_name=True),
+                                               parse_mode=ParseMode.HTML, reply_markup=self._aa_upload_markup())
+                else:
+                    await self._safe_reply(update, self._aa_upload_text(awaiting_name=True),
+                                           parse_mode=ParseMode.HTML, reply_markup=self._aa_upload_markup())
+                return
             else:
                 await self._safe_reply(update,
                                        f'✅ <b>Успешно загружено:</b>\n📁 <code>{html.escape(destination.name)}</code>\n⚖️ Размер: {self._format_bytes(size)}',
@@ -1660,12 +1748,77 @@ class TelegramBotService(QObject):
             new_path = self._build_unique_destination(new_path)
             old_path.rename(new_path)
 
-            await self._safe_reply(update, f'✅ Шаблон сохранен как <b>{html.escape(new_path.name)}</b>',
-                                   parse_mode=ParseMode.HTML, dismissable=True)
+            upload_msg_id = self._aa_upload_msg_id_by_user.pop(user_id, None)
+            success_text = f'✅ <b>Шаблон сохранен как {html.escape(new_path.name)}</b>'
+            if upload_msg_id and self._application:
+                try:
+                    bot_username = self._application.bot.username
+                    listing_text = await asyncio.to_thread(
+                        self._build_aa_listing_text,
+                        self._autoaccept_template_dir(),
+                        bot_username,
+                    )
+                    self._aa_list_msg_id_by_user[user_id] = upload_msg_id
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=upload_msg_id,
+                        text=f'{success_text}\n\n{listing_text}',
+                        reply_markup=self._aa_listing_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    await self._safe_reply(update, success_text, parse_mode=ParseMode.HTML, dismissable=True)
+            else:
+                await self._safe_reply(update, success_text, parse_mode=ParseMode.HTML, dismissable=True)
             return
+
 
         action = self._pending_action_by_user.pop(user_id, None)
         if not action:
+            return
+
+        if action == 'aa_timeout':
+            msg_id = self._menu_msg_id_by_user.get(user_id)
+            try:
+                timeout = self._set_autoaccept_timeout(self._parse_duration_token(text.strip()))
+                success_text = (
+                    f'✅ <b>Таймаут AutoAccept обновлен:</b> '
+                    f'<code>{html.escape(self._format_autoaccept_timeout(timeout))}</code>\n\n'
+                    f'{self._autoaccept_menu_text()}'
+                )
+                if msg_id:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=msg_id,
+                        text=success_text,
+                        reply_markup=self._autoaccept_menu_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    self._aa_menu_messages[user_id] = msg_id
+                else:
+                    await self._safe_reply(update, success_text, parse_mode=ParseMode.HTML,
+                                           reply_markup=self._autoaccept_menu_markup())
+            except Exception as exc:
+                self._pending_action_by_user[user_id] = 'aa_timeout'
+                error_text = (
+                    f'❌ <b>Не удалось распознать время:</b> <code>{html.escape(str(exc))}</code>\n\n'
+                    f'{self._aa_timeout_text()}'
+                )
+                if msg_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=user_id,
+                            message_id=msg_id,
+                            text=error_text,
+                            reply_markup=self._aa_timeout_markup(),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        await self._safe_reply(update, error_text, parse_mode=ParseMode.HTML,
+                                               reply_markup=self._aa_timeout_markup())
+                else:
+                    await self._safe_reply(update, error_text, parse_mode=ParseMode.HTML,
+                                           reply_markup=self._aa_timeout_markup())
             return
 
         if action == 'ocr_query':
@@ -1975,6 +2128,7 @@ class TelegramBotService(QObject):
             target = self._autoaccept_template_dir() / filename
             if target.exists() and target.is_file():
                 target.unlink()
+                await self._refresh_aa_listing_message(update.effective_user.id)
                 await self._safe_reply(update, f'🗑 Шаблон <b>{html.escape(filename)}</b> удален.',
                                        parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             else:
@@ -2257,8 +2411,10 @@ class TelegramBotService(QObject):
             return
 
         try:
-            timeout = int(context.args[0]) if context.args else 300
-            timeout = max(10, min(timeout, 3600))
+            timeout = self._current_autoaccept_timeout()
+            if context.args:
+                timeout = self._parse_duration_token(context.args[0])
+            timeout = self._set_autoaccept_timeout(timeout)
             template_dir = self._autoaccept_template_dir()
             result = await asyncio.to_thread(
                 self._auto_accept_service.start,
@@ -3621,20 +3777,97 @@ class TelegramBotService(QObject):
                 self.log_message.emit(f'Failed to send scheduled audio to admin {admin_id}: {exc}')
 
     async def _show_autoaccept_menu(self, query) -> None:
-        text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
-        is_active = self._auto_accept_service.active
-        toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept',
-                                          callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton(
-            '▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
-
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
-            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'),
-             InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
-            [toggle_btn], [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
-        ])
-        await self._edit_panel_message(query, text, markup)
+        await self._edit_panel_message(query, self._autoaccept_menu_text(), self._autoaccept_menu_markup())
         self._aa_menu_messages[query.message.chat_id] = query.message.message_id
+
+    def _autoaccept_menu_text(self) -> str:
+        timeout = self._format_autoaccept_timeout(self._current_autoaccept_timeout())
+        state = '\u0432\u043a\u043b\u044e\u0447\u0435\u043d' if self._auto_accept_service.active else '\u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d'
+        return (
+            '\U0001f916 <b>\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 AutoAccept</b>\n\n'
+            '\u0417\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u0435 \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442\u044b \u0448\u0430\u0431\u043b\u043e\u043d\u043e\u0432 \u0434\u043b\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u043e\u0433\u043e \u043f\u043e\u0438\u0441\u043a\u0430 \u0438 \u043a\u043b\u0438\u043a\u0430 \u043d\u0430 \u044d\u043a\u0440\u0430\u043d\u0435.\n'
+            f'\u23f1 <b>\u0410\u0432\u0442\u043e\u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435:</b> <code>{html.escape(timeout)}</code>\n'
+            f'\U0001f4e1 <b>\u0421\u0442\u0430\u0442\u0443\u0441:</b> <code>{state}</code>'
+        )
+
+    def _autoaccept_menu_markup(self) -> InlineKeyboardMarkup:
+        is_active = self._auto_accept_service.active
+        current_timeout = self._current_autoaccept_timeout()
+
+        def timeout_button(label: str, seconds: int) -> InlineKeyboardButton:
+            prefix = '\u2705 ' if current_timeout == seconds else ''
+            return InlineKeyboardButton(f'{prefix}{label}', callback_data=f'panel:aa:timeout:{seconds}')
+
+        toggle_btn = InlineKeyboardButton('\u23f9 \u0412\u044b\u043a\u043b\u044e\u0447\u0438\u0442\u044c AutoAccept',
+                                          callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton(
+            '\u25b6\ufe0f \u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c AutoAccept', callback_data='panel:input:autoaccept:on')
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('\U0001f4f8 \u0417\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442', callback_data='panel:aa:upload')],
+            [InlineKeyboardButton('\U0001f4c2 \u0421\u043f\u0438\u0441\u043e\u043a \u0448\u0430\u0431\u043b\u043e\u043d\u043e\u0432', callback_data='panel:aa:ls'),
+             InlineKeyboardButton('\U0001f5d1 \u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0451', callback_data='panel:aa:clear')],
+            [timeout_button('1\u043c', 60), timeout_button('5\u043c', 300), timeout_button('10\u043c', 600)],
+            [timeout_button('30\u043c', 1800), timeout_button('60\u043c', 3600),
+             InlineKeyboardButton('\u270f\ufe0f \u0421\u0432\u043e\u0435', callback_data='panel:aa:timeout:custom')],
+            [toggle_btn], [InlineKeyboardButton('\u2b05\ufe0f \u041d\u0430\u0437\u0430\u0434', callback_data='panel:input')]
+        ])
+
+    @staticmethod
+    def _aa_timeout_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton('\u2b05\ufe0f \u041d\u0430\u0437\u0430\u0434', callback_data='panel:aa:main')]])
+
+    def _aa_timeout_text(self) -> str:
+        timeout = self._format_autoaccept_timeout(self._current_autoaccept_timeout())
+        return (
+            '\u23f1 <b>\u0422\u0430\u0439\u043c\u0430\u0443\u0442 AutoAccept</b>\n\n'
+            f'\u0421\u0435\u0439\u0447\u0430\u0441: <code>{html.escape(timeout)}</code>\n'
+            '\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0432\u0440\u0435\u043c\u044f \u043e\u0434\u043d\u0438\u043c \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435\u043c.\n'
+            '<i>\u041f\u0440\u0438\u043c\u0435\u0440\u044b: 600, 10m, 30m, 1h</i>\n'
+            '\u0414\u043e\u043f\u0443\u0441\u0442\u0438\u043c\u044b\u0439 \u0434\u0438\u0430\u043f\u0430\u0437\u043e\u043d: <code>10..3600</code> \u0441\u0435\u043a.'
+        )
+
+    @staticmethod
+    def _aa_listing_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('📸 Загрузить шаблон', callback_data='panel:aa:upload')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='panel:aa:main')],
+        ])
+
+    @staticmethod
+    def _aa_upload_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отменить', callback_data='panel:aa:cancelupload')]])
+
+    @staticmethod
+    def _aa_upload_text(awaiting_name: bool = False) -> str:
+        if awaiting_name:
+            return (
+                '✏️ <b>Шаблон загружен.</b>\n'
+                'Теперь отправьте одним сообщением имя шаблона.\n'
+                '<i>Пример: accept_btn</i>'
+            )
+        return (
+            '📸 <b>Отправь скриншот/шаблон как фото или файл.</b>\n'
+            'Он будет сохранен для AutoAccept.'
+        )
+
+    async def _refresh_aa_listing_message(self, user_id: int) -> None:
+        application = self._application
+        message_id = self._aa_list_msg_id_by_user.get(user_id)
+        if application is None or message_id is None:
+            return
+        try:
+            bot_username = application.bot.username
+            text = await asyncio.to_thread(self._build_aa_listing_text, self._autoaccept_template_dir(), bot_username)
+            await application.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=self._aa_listing_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            if 'Message is not modified' not in str(exc):
+                self.log_message.emit(f'Failed to refresh AutoAccept listing for {user_id}: {exc}')
+                self._aa_list_msg_id_by_user.pop(user_id, None)
 
     # === НАЧАЛО НОВЫХ ФУНКЦИЙ ГОЛОСА, ОВЕРЛЕЯ И ОХРАНЫ ===
     async def _start_overlay_timer(self, total_seconds: int, title: str, tid: str):
@@ -4081,6 +4314,10 @@ class TelegramBotService(QObject):
             await self._edit_panel_message(query, self._panel_logs_text(), self._panel_logs_markup())
             return
         if data == 'panel:aa:main':
+            if self._pending_action_by_user.get(update.effective_user.id) == 'aa_timeout':
+                self._pending_action_by_user.pop(update.effective_user.id, None)
+            self._aa_list_msg_id_by_user.pop(update.effective_user.id, None)
+            self._aa_upload_msg_id_by_user.pop(update.effective_user.id, None)
             await self._show_autoaccept_menu(query)
             return
 
@@ -4213,20 +4450,36 @@ class TelegramBotService(QObject):
         if data == 'panel:aa:upload':
             user_id = update.effective_user.id
             target = self._autoaccept_template_dir()
+            self._pending_action_by_user.pop(user_id, None)
             self._pending_upload_by_user[user_id] = target
-            await self._safe_reply(
-                update,
-                f'📸 <b>Отправь скриншот/шаблон как фото или файл.</b>\nОн будет сохранен для AutoAccept.\n\nИспользуйте /cancelupload для отмены.',
-                parse_mode=ParseMode.HTML, dismissable=True
-            )
+            self._aa_menu_messages.pop(query.message.chat_id, None)
+            self._aa_list_msg_id_by_user.pop(user_id, None)
+            self._aa_upload_msg_id_by_user[user_id] = query.message.message_id
+            await self._edit_panel_message(query, self._aa_upload_text(), self._aa_upload_markup())
+            return
+        if data == 'panel:aa:cancelupload':
+            user_id = update.effective_user.id
+            self._pending_action_by_user.pop(user_id, None)
+            self._pending_upload_by_user.pop(user_id, None)
+            pending_template = self._pending_rename_by_user.pop(user_id, None)
+            if pending_template and pending_template.exists():
+                try:
+                    pending_template.unlink()
+                except Exception:
+                    pass
+            self._aa_upload_msg_id_by_user.pop(user_id, None)
+            await self._show_autoaccept_menu(query)
             return
         if data == 'panel:aa:ls':
-            target = self._autoaccept_template_dir()
             try:
+                user_id = update.effective_user.id
+                self._pending_action_by_user.pop(user_id, None)
+                self._aa_menu_messages.pop(query.message.chat_id, None)
+                self._aa_upload_msg_id_by_user.pop(user_id, None)
+                self._aa_list_msg_id_by_user[user_id] = query.message.message_id
                 bot_username = self._application.bot.username
-                text = await asyncio.to_thread(self._build_aa_listing_text, target, bot_username)
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='panel:aa:main')]])
-                await self._safe_reply(update, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                text = await asyncio.to_thread(self._build_aa_listing_text, self._autoaccept_template_dir(), bot_username)
+                await self._edit_panel_message(query, text, self._aa_listing_markup())
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка чтения: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True)
@@ -4234,14 +4487,35 @@ class TelegramBotService(QObject):
         if data == 'panel:aa:clear':
             target = self._autoaccept_template_dir()
             try:
+                self._pending_action_by_user.pop(update.effective_user.id, None)
                 for item in target.iterdir():
                     if item.is_file():
                         item.unlink()
+                await self._refresh_aa_listing_message(update.effective_user.id)
                 await self._safe_reply(update, '🗑 <b>Все шаблоны AutoAccept успешно очищены.</b>',
                                        parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
             except Exception as exc:
                 await self._safe_reply(update, f'❌ Ошибка очистки: <code>{html.escape(str(exc))}</code>',
                                        parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+            return
+
+        if data == 'panel:aa:timeout:custom':
+            user_id = update.effective_user.id
+            self._pending_action_by_user[user_id] = 'aa_timeout'
+            self._menu_msg_id_by_user[user_id] = query.message.message_id
+            self._aa_menu_messages.pop(query.message.chat_id, None)
+            self._aa_list_msg_id_by_user.pop(user_id, None)
+            self._aa_upload_msg_id_by_user.pop(user_id, None)
+            await self._edit_panel_message(query, self._aa_timeout_text(), self._aa_timeout_markup())
+            return
+        if data.startswith('panel:aa:timeout:'):
+            try:
+                self._pending_action_by_user.pop(update.effective_user.id, None)
+                timeout = self._set_autoaccept_timeout(int(data.rsplit(':', 1)[1]))
+                await query.answer(f'⏱ Таймаут: {self._format_autoaccept_timeout(timeout)}', show_alert=False)
+            except Exception as exc:
+                await query.answer(f'❌ Ошибка: {exc}', show_alert=True)
+            await self._show_autoaccept_menu(query)
             return
 
         # Processes & CMD
@@ -4513,7 +4787,7 @@ class TelegramBotService(QObject):
 
         if data == 'panel:input:autoaccept:on':
             try:
-                timeout = 300
+                timeout = self._current_autoaccept_timeout()
                 template_dir = self._autoaccept_template_dir()
                 await asyncio.to_thread(
                     self._auto_accept_service.start,
@@ -5245,7 +5519,7 @@ class TelegramBotService(QObject):
             '<code>/cliphistory</code>\n'
             '<code>/ocr [query]</code>\n'
             '<code>/antiafkon</code> <code>/antiafkoff</code>\n'
-            '<code>/autoaccepton [timeout]</code>\n'
+            '<code>/autoaccepton [600|10m|1h]</code>\n'
             '<code>/autoacceptoff</code>\n'
             '<code>/schedulein 20m webcam:15 audio:20 --if-cpu-below 12 --comment Ночная проверка</code>\n'
             '<code>/schedulein 20m ocrscreen clipboard —comment Проверить экран и буфер</code>\n'
@@ -5369,17 +5643,8 @@ class TelegramBotService(QObject):
     async def _update_aa_menus(self):
         application = self._application
         if not application: return
-        is_active = self._auto_accept_service.active
-        toggle_btn = InlineKeyboardButton('⏹ Выключить AutoAccept',
-                                          callback_data='panel:input:autoaccept:off') if is_active else InlineKeyboardButton(
-            '▶️ Включить AutoAccept', callback_data='panel:input:autoaccept:on')
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton('📸 Загрузить скриншот', callback_data='panel:aa:upload')],
-            [InlineKeyboardButton('📂 Список шаблонов', callback_data='panel:aa:ls'),
-             InlineKeyboardButton('🗑 Очистить всё', callback_data='panel:aa:clear')],
-            [toggle_btn], [InlineKeyboardButton('⬅️ Назад', callback_data='panel:input')]
-        ])
-        text = '🤖 <b>Управление AutoAccept</b>\n\nЗагрузите скриншоты шаблонов для автоматического поиска и клика на экране.'
+        markup = self._autoaccept_menu_markup()
+        text = self._autoaccept_menu_text()
         for chat_id, msg_id in list(self._aa_menu_messages.items()):
             try:
                 await application.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id,
@@ -5699,6 +5964,8 @@ class TelegramBotService(QObject):
             if hasattr(self, '_pending_action_by_user'): self._pending_action_by_user.clear()
             if hasattr(self, '_process_filter_by_user'): self._process_filter_by_user.clear()
             if hasattr(self, '_pending_rename_by_user'): self._pending_rename_by_user.clear()
+            if hasattr(self, '_aa_upload_msg_id_by_user'): self._aa_upload_msg_id_by_user.clear()
+            if hasattr(self, '_aa_list_msg_id_by_user'): self._aa_list_msg_id_by_user.clear()
             if hasattr(self, '_aa_menu_messages'): self._aa_menu_messages.clear()
             if hasattr(self, '_menu_msg_id_by_user'): self._menu_msg_id_by_user.clear()
             if hasattr(self, '_media_menu_msg_id_by_user'): self._media_menu_msg_id_by_user.clear()
