@@ -14,6 +14,11 @@ try:
     import pyautogui
 except ImportError:
     pyautogui = None
+    
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
 
 try:
     import pyperclip
@@ -148,6 +153,70 @@ def stop_anti_afk() -> CommandResult:
     if not _afk_active: return CommandResult(False, "Anti-AFK не запущен.")
     _afk_active = False
     return CommandResult(True, "Anti-AFK остановлен.")
+    
+    
+# --- Stealth Mode ---
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long)]
+
+_stealth_active = False
+
+def is_stealth_mode_active() -> bool:
+    global _stealth_active
+    return _stealth_active
+
+def _action_on_space():
+    # 1. Снимаем все блокировки
+    stop_stealth_mode()
+    # 2. Блокируем экран (используем уже существующую функцию)
+    from .system_actions import lock_workstation
+    try:
+        lock_workstation()
+    except Exception:
+        pass
+
+def start_stealth_mode() -> CommandResult:
+    global _stealth_active
+    if keyboard is None:
+        return CommandResult(False, "Установите библиотеку: pip install keyboard")
+    if _stealth_active:
+        return CommandResult(False, "Режим блокировки уже включен.")
+
+    _stealth_active = True
+
+    # Блокируем все клавиши, кроме пробела (скан-код 57)
+    for i in range(1, 150):
+        if i != 57: 
+            try:
+                keyboard.block_key(i)
+            except Exception:
+                pass
+    
+    # Назначаем действие на пробел
+    keyboard.on_press_key('space', lambda _: _action_on_space(), suppress=True)
+
+    # Запираем курсор в верхнем левом углу (1x1 пиксель)
+    rect = RECT(0, 0, 1, 1)
+    ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+
+    return CommandResult(True, "Блокировка включена. Мышь и клавиатура заблокированы. Пробел -> Lock Screen.")
+
+def stop_stealth_mode() -> CommandResult:
+    global _stealth_active
+    if not _stealth_active:
+        return CommandResult(False, "Режим блокировки не запущен.")
+    
+    _stealth_active = False
+
+    if keyboard is not None:
+        keyboard.unhook_all()
+    
+    # Возвращаем свободу мыши
+    ctypes.windll.user32.ClipCursor(None)
+    return CommandResult(True, "Блокировка снята, управление восстановлено.")
 
 @dataclass(slots=True)
 class AutoAcceptConfig:

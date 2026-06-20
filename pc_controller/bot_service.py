@@ -50,6 +50,9 @@ from .input_actions import (
     set_clipboard,
     start_anti_afk,
     stop_anti_afk,
+    is_stealth_mode_active,
+    start_stealth_mode,
+    stop_stealth_mode,
 )
 from .logging_setup import LOG_FILE
 from .ocr_actions import extract_text_from_image_bytes, find_matching_lines
@@ -200,6 +203,7 @@ HELP_TEXT = """✨ <b>PC Controller — Список команд</b> ✨
 🔸 /cliphistory - История буфера
 🔸 /antiafkon, /antiafkoff - Anti-AFK
 🔸 /autoaccepton, /autoacceptoff
+🔸 /s - Вкл/выкл полную блокировку ввода
 
 🌐 <b>Прочее:</b>
 🔸 /ocr [query] - OCR текущего экрана
@@ -2281,6 +2285,22 @@ class TelegramBotService(QObject):
                         await self._edit_panel_message(update.callback_query, msg_text, markup)
                     else:
                         await self._safe_reply(update, msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                else:
+                    await self._safe_reply(update, f'❌ {html.escape(result.message)}', dismissable=True, as_toast=True)
+        except Exception as exc:
+            await self._safe_reply(update, f'❌ Ошибка: {exc}', dismissable=True)
+            
+    async def _command_stealth(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._delete_user_message(update)
+        if not await self._ensure_admin(update, 'input'): return
+        try:
+            if is_stealth_mode_active():
+                result = await asyncio.to_thread(stop_stealth_mode)
+                await self._safe_reply(update, f'🔓 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
+            else:
+                result = await asyncio.to_thread(start_stealth_mode)
+                if result.ok:
+                    await self._safe_reply(update, f'🔒 <b>{html.escape(result.message)}</b>', parse_mode=ParseMode.HTML, dismissable=True, as_toast=True)
                 else:
                     await self._safe_reply(update, f'❌ {html.escape(result.message)}', dismissable=True, as_toast=True)
         except Exception as exc:
@@ -4771,6 +4791,22 @@ class TelegramBotService(QObject):
         if data == 'panel:input:righthold':
             await self._command_righthold(update, context)
             return
+            
+        if data == 'panel:input:stealth:toggle':
+            from .input_actions import is_stealth_mode_active, start_stealth_mode, stop_stealth_mode
+            active = is_stealth_mode_active()
+            if active:
+                await asyncio.to_thread(stop_stealth_mode)
+                await query.answer("🔓 Блокировка выключена", show_alert=False)
+            else:
+                res = await asyncio.to_thread(start_stealth_mode)
+                if res.ok:
+                    await query.answer("🔒 Блокировка включена (Пробел - лок)", show_alert=False)
+                else:
+                    await query.answer(f"❌ {res.message}", show_alert=True)
+
+            await self._edit_panel_message(query, self._panel_input_text(), self._panel_input_markup())
+            return
 
         if data == 'panel:input:antiafk:toggle':
             from .input_actions import is_anti_afk_active, start_anti_afk, stop_anti_afk
@@ -5453,7 +5489,10 @@ class TelegramBotService(QObject):
         is_afk = is_anti_afk_active()
         afk_btn = InlineKeyboardButton('🛑 Выкл Anti-AFK',callback_data='panel:input:antiafk:toggle') if is_afk \
             else InlineKeyboardButton('🎮 Вкл Anti-AFK', callback_data='panel:input:antiafk:toggle')
-
+        is_stealth = is_stealth_mode_active()
+        stealth_btn = InlineKeyboardButton('🔓 Выкл Блокировку', callback_data='panel:input:stealth:toggle') if is_stealth \
+            else InlineKeyboardButton('🔒 Вкл Блокировку', callback_data='panel:input:stealth:toggle')
+        
         return InlineKeyboardMarkup([
             [InlineKeyboardButton('✏️ Свой Текст', callback_data='panel:input:custom_text'),
              InlineKeyboardButton('🔠 Свои Клавиши', callback_data='panel:input:custom_combo')],
@@ -5461,7 +5500,7 @@ class TelegramBotService(QObject):
              InlineKeyboardButton('🗣 Озвучить текст', callback_data='panel:input:voice')],
             [InlineKeyboardButton('⏲ Таймеры и Напоминания', callback_data='panel:input:reminders')],
             [InlineKeyboardButton('📋 Буфер обмена', callback_data='panel:input:clip')],
-            [afk_btn],
+            [afk_btn, stealth_btn],
             [InlineKeyboardButton('🖥 Свернуть окна', callback_data='panel:input:showdesk'),
              InlineKeyboardButton('🪟 Alt + Tab', callback_data='panel:input:alttab')],
             [InlineKeyboardButton('🖱 ЛКМ', callback_data='panel:input:leftclick'),
@@ -5867,6 +5906,7 @@ class TelegramBotService(QObject):
         self._application.add_handler(CommandHandler('movemouse', self._command_movemouse))
         self._application.add_handler(CommandHandler('autoaccepton', self._command_autoaccept_on))
         self._application.add_handler(CommandHandler('autoacceptoff', self._command_autoaccept_off))
+        self._application.add_handler(CommandHandler('s', self._command_stealth))
         self._application.add_handler(CallbackQueryHandler(self._handle_panel_callback, pattern=r'^panel:'))
         self._application.add_handler(
             MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO, self._handle_document_upload))
@@ -5936,6 +5976,10 @@ class TelegramBotService(QObject):
                             break
         finally:
             self.log_message.emit('Очистка соединений...')
+            
+            from .input_actions import stop_stealth_mode
+            await asyncio.to_thread(stop_stealth_mode)
+            
             if self._hibernate_task and not self._hibernate_task.done():
                 self._hibernate_task.cancel()
             if self._scheduler_task and not self._scheduler_task.done():
