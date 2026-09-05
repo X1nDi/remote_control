@@ -14,3 +14,4 @@ old_main_legacy.py
 old/
 
 /tmp_ocr_ru.png
+/.tmp-*

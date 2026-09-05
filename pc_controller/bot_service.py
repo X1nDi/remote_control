@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -32,6 +33,7 @@ from telegram.ext import (
 )
 
 from .config import AppConfig
+from .file_sharing import TELEGRAM_FILE_LIMIT, upload_large_file
 from .clipboard_history import ClipboardHistoryService
 from .input_actions import (
     AUTOACCEPT_DIR,
@@ -132,7 +134,7 @@ class OverlayWidget(QWidget):
         self.hide()
 
 
-MAX_DOWNLOAD_FILE_SIZE = 45 * 1024 * 1024
+MAX_DOWNLOAD_FILE_SIZE = TELEGRAM_FILE_LIMIT
 MAX_LIST_ITEMS = 120
 WINDOWS_PAGE_SIZE = 8
 CLIPBOARD_HISTORY_PAGE_SIZE = 6
@@ -250,6 +252,7 @@ class TelegramBotService(QObject):
         self._live_stream_stop_events: dict[int, asyncio.Event] = {}
         self._live_stream_tasks: dict[int, asyncio.Task] = {}
         self._dir_items_by_user: dict[int, list[str]] = {}
+        self._download_listings_by_user: dict[int, tuple[str, list[Path]]] = {}
         self._hibernate_task: asyncio.Task | None = None
         self._auto_accept_service = AutoAcceptService()
         self._clipboard_history = ClipboardHistoryService()
@@ -621,36 +624,48 @@ class TelegramBotService(QObject):
             if arg.startswith('dl_'):
                 if not await self._ensure_admin(update, 'files'): return
                 user_id = update.effective_user.id
-                idx = int(arg[3:])
-                items = self._dir_items_by_user.get(user_id, [])
-                if 0 <= idx < len(items):
-                    target_name = items[idx]
-                    try:
-                        target = self._resolve_user_path(user_id, target_name)
-                        if target.exists() and target.is_file():
-                            size = target.stat().st_size
-                            if size > 45 * 1024 * 1024:
-                                raise ValueError('Файл слишком большой (>45MB).')
-                            temp_msg = await self._send_temporary_status(update, '⏳ <b>Отправка файла...</b>')
-                            try:
-                                with target.open('rb') as f:
-                                    suf = target.suffix.lower()
-                                    if suf in {'.png', '.jpg', '.jpeg', '.bmp'}:
-                                        await update.effective_chat.send_photo(photo=f,
-                                                                               caption=html.escape(target.name),
-                                                                               reply_markup=self._dismiss_markup())
-                                    elif suf in {'.mp4', '.avi', '.mov', '.mkv'}:
-                                        await update.effective_chat.send_video(video=f,
-                                                                               caption=html.escape(target.name),
-                                                                               reply_markup=self._dismiss_markup())
-                                    else:
-                                        await update.effective_chat.send_document(document=f, filename=target.name,
-                                                                                  caption=html.escape(target.name),
-                                                                                  reply_markup=self._dismiss_markup())
-                            finally:
-                                await self._delete_message_safe(temp_msg)
-                    except Exception as e:
-                        await self._safe_reply(update, f'❌ Ошибка: {e}', dismissable=True)
+                match = re.fullmatch(r'dl_([a-f0-9]{16})_(\d+)', arg)
+                listing = self._download_listings_by_user.get(user_id)
+                if not match or not listing or match[1] != listing[0] or int(match[2]) >= len(listing[1]):
+                    await self._safe_reply(
+                        update, 'ℹ️ Ссылка на файл устарела после перезапуска или обновления списка. '
+                        'Откройте папку заново и нажмите имя файла. '
+                        'Также можно использовать /download с полным путём к файлу.',
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                            '📂 Обновить список файлов', callback_data='panel:files:ls')]]))
+                    return
+                target = listing[1][int(match[2])]
+                try:
+                    target = self._resolve_user_path(user_id, str(target))
+                    if not target.exists() or not target.is_file():
+                        await self._safe_reply(update, '❌ Файл больше не существует. Обновите список файлов.',
+                                               dismissable=True)
+                        return
+                    if target.exists() and target.is_file():
+                        size = target.stat().st_size
+                        if size > MAX_DOWNLOAD_FILE_SIZE:
+                            await self._share_large_file(update, target)
+                            return
+                        temp_msg = await self._send_temporary_status(update, '⏳ <b>Отправка файла...</b>')
+                        try:
+                            with target.open('rb') as f:
+                                suf = target.suffix.lower()
+                                if suf in {'.png', '.jpg', '.jpeg', '.bmp'}:
+                                    await update.effective_chat.send_photo(photo=f,
+                                                                           caption=html.escape(target.name),
+                                                                           reply_markup=self._dismiss_markup())
+                                elif suf in {'.mp4', '.avi', '.mov', '.mkv'}:
+                                    await update.effective_chat.send_video(video=f,
+                                                                           caption=html.escape(target.name),
+                                                                           reply_markup=self._dismiss_markup())
+                                else:
+                                    await update.effective_chat.send_document(document=f, filename=target.name,
+                                                                              caption=html.escape(target.name),
+                                                                              reply_markup=self._dismiss_markup())
+                        finally:
+                            await self._delete_message_safe(temp_msg)
+                except Exception as e:
+                    await self._safe_reply(update, f'❌ Ошибка: {e}', dismissable=True)
                 return
 
         await self._safe_reply(update, HELP_TEXT, reply_markup=self._panel_main_markup(), parse_mode=ParseMode.HTML)
@@ -1553,9 +1568,8 @@ class TelegramBotService(QObject):
                 raise ValueError('File does not exist.')
             size = target.stat().st_size
             if size > MAX_DOWNLOAD_FILE_SIZE:
-                raise ValueError(
-                    f'File is too large ({self._format_bytes(size)}). Limit is {self._format_bytes(MAX_DOWNLOAD_FILE_SIZE)}.'
-                )
+                await self._share_large_file(update, target)
+                return
 
             temp_msg = await self._send_temporary_status(update,
                                                          f'⏳ <b>Подготовка файла {html.escape(target.name)}...</b>')
@@ -1577,6 +1591,22 @@ class TelegramBotService(QObject):
         except Exception as exc:
             await self._safe_reply(update, f'❌ Ошибка /download: <code>{html.escape(str(exc))}</code>',
                                    parse_mode=ParseMode.HTML, dismissable=True)
+
+    async def _share_large_file(self, update: Update, target: Path) -> None:
+        status = await self._send_temporary_status(
+            update, '⏳ <b>Файл больше 45 МБ. Загрузка на Gofile…</b>\n'
+            'После завершения пришлю ссылку. Доступ — у любого, кто получил ссылку.')
+        try:
+            shared = await asyncio.to_thread(upload_large_file, target)
+            await self._safe_reply(
+                update, f'📥 <b>{html.escape(target.name)}</b> '
+                f'({self._format_bytes(shared.size)})\n'
+                f'<a href="{html.escape(shared.url, quote=True)}">Скачать с Gofile</a>\n'
+                'Временное хранение. Ссылка доступна всем, у кого она есть.\n'
+                f'SHA-256: <code>{shared.sha256}</code>',
+                parse_mode=ParseMode.HTML, dismissable=True)
+        finally:
+            await self._delete_message_safe(status)
 
     async def _command_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._delete_user_message(update)
@@ -6016,6 +6046,7 @@ class TelegramBotService(QObject):
             if hasattr(self, '_live_stream_stop_events'): self._live_stream_stop_events.clear()
             if hasattr(self, '_live_stream_tasks'): self._live_stream_tasks.clear()
             if hasattr(self, '_dir_items_by_user'): self._dir_items_by_user.clear()
+            if hasattr(self, '_download_listings_by_user'): self._download_listings_by_user.clear()
 
             self.log_message.emit('Bot stopped.')
 
@@ -6100,6 +6131,8 @@ class TelegramBotService(QObject):
 
         entries = sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
         self._dir_items_by_user[user_id] = [e.name for e in entries]
+        listing_id = uuid.uuid4().hex[:16]
+        self._download_listings_by_user[user_id] = (listing_id, [entry.resolve() for entry in entries])
 
         total_pages = (len(entries) + page_size - 1) // page_size if entries else 1
         if page < 0: page = 0
@@ -6127,7 +6160,7 @@ class TelegramBotService(QObject):
                 lines.append(
                     f'<a href="{rm_link}">❌</a> 📁 <a href="{action_link}">{safe_name}</a> <code>[{size_str}]</code>')
             else:
-                action_link = f'https://t.me/{bot_username}?start=dl_{i}'
+                action_link = f'https://t.me/{bot_username}?start=dl_{listing_id}_{i}'
                 size_str = self._format_bytes(entry.stat().st_size)
                 lines.append(
                     f'<a href="{rm_link}">❌</a> 📄 <a href="{action_link}">{safe_name}</a> <code>[{size_str}]</code>')
